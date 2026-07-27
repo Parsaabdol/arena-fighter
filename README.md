@@ -95,4 +95,7 @@ protected, so everything goes through a pull request.
 
 ## License
 
-MIT — see [LICENSE](LICENSE). Bundled raylib is zlib-licensed.
+MIT — see [LICENSE](LICENSE).
+
+This repo bundles raylib, which is zlib-licensed; see
+[THIRD-PARTY-NOTICES.md](THIRD-PARTY-NOTICES.md).
