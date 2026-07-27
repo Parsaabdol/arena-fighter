@@ -1,0 +1,15 @@
+# Normalise line endings so contributors on other platforms do not produce
+# diffs that are nothing but invisible whitespace.
+* text=auto
+
+*.c  text
+*.h  text
+*.md text
+
+# Batch files genuinely need CRLF -- cmd.exe mis-parses LF-only scripts.
+*.bat text eol=crlf
+
+# Vendored raylib binaries: never touch these.
+*.dll binary
+*.lib binary
+*.exe binary
