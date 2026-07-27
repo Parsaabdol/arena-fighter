@@ -42,8 +42,23 @@ bool intro_draw(float dt);
 /*
  * The landing screen. Same immediate-mode contract as the settings pages: it
  * draws itself and reports what the user asked for this frame -- one of
- * MENU_PLAY, MENU_OPEN_SETTINGS, MENU_OPEN_KEYBINDS or MENU_QUIT.
+ * MENU_PLAY, MENU_OPEN_SKINS, MENU_OPEN_SETTINGS, MENU_OPEN_KEYBINDS or
+ * MENU_QUIT.
  */
 MenuAction main_menu(void);
+
+/*
+ * Appearance, in two levels: `customize_menu` is colours and the way in, and
+ * `modskins_menu` one step below it is the list of models actually installed in
+ * assets/. Keeping the mod list on its own page is what stops a growing
+ * collection of skins from crowding out the options next to it.
+ *
+ * Neither has a preview viewport: the fighter standing in the arena behind the
+ * panel IS the preview. main.c draws the world with the hero being edited while
+ * either page is open, and both let you drag to orbit and scroll to zoom, so
+ * you are inspecting the real character under the real camera.
+ */
+MenuAction customize_menu(Hero *pending, const Hero *applied);
+MenuAction modskins_menu(Hero *pending, const Hero *applied);
 
 #endif /* FRONTEND_H */

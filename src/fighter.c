@@ -8,12 +8,36 @@
 /* Movement feel. Tuned in units/second; the tick rate is factored in below so
  * changing TICK_HZ does not change how the character handles. */
 #define MOVE_ACCEL    60.0f   /* how hard we push toward the desired velocity */
-#define MOVE_MAX       6.0f   /* walking top speed                            */
 #define MOVE_FRICTION 12.0f   /* deceleration when there is no input          */
 #define TURN_RATE     14.0f   /* radians/second the model rotates to face travel */
 
-/* GRAVITY, JUMP_SPEED and SPRINT_MULT live in game.h -- render needs them. */
+/* GRAVITY, JUMP_SPEED, MOVE_MAX and SPRINT_MULT live in game.h -- the
+ * renderer and the imported-skin clip pacing need them. */
 #define AIR_CONTROL    0.35f  /* fraction of ground acceleration while airborne */
+
+/* ---------------------------------------------------------------------------
+ * Crouch.
+ *
+ * A held modifier rather than a toggle, and grounded-only: holding it in the
+ * air does nothing, but it takes effect the instant you land. It costs speed,
+ * which is the whole trade -- and it locks out sprinting, because "crouch-
+ * sprinting" would just be walking with extra steps.
+ * ------------------------------------------------------------------------- */
+#define CROUCH_SPEED_MULT   0.45f
+#define CROUCH_ACCEL_MULT   0.70f
+#define CROUCH_BLEND_RATE  12.0f   /* how fast the crouch POSE eases in/out  */
+
+/* The band of vertical speed either side of zero that reads as hanging at the
+ * top of the arc rather than as rising or falling. */
+#define APEX_VY             1.6f
+
+/* Takeoff lasts only as long as the push-off pose does. */
+#define TAKEOFF_TIME        0.10f
+
+/* Landing squash. Animation only: a landing that took control away would cost
+ * far more in feel than the pose is worth. The blend starts at how hard you
+ * hit and decays at a fixed rate, so a small hop settles faster than a drop. */
+#define LAND_DECAY_RATE     (1.0f / 0.20f)
 
 /* ---------------------------------------------------------------------------
  * Stamina.
@@ -86,6 +110,11 @@ static const AttackDef ATTACKS[ATTACK_CHAIN] = {
 #define ATTACK_CONTROL_MULT 0.30f
 #define ATTACK_TURN_MULT    0.30f
 
+/* Swinging in the air is allowed, and it is the same chain -- but you cannot
+ * turn a swing into extra hang time, so the lunge is cut to a nudge rather than
+ * a step you could ride across the arena. */
+#define AIR_LUNGE_MULT      0.45f
+
 static float ease_out(float t) { return 1.0f - (1.0f - t) * (1.0f - t); }
 static float ease_in(float t)  { return t * t; }
 
@@ -132,6 +161,12 @@ static float lerpf(float a, float b, float t)
     return a + (b - a) * t;
 }
 
+const char *const ANIM_NAMES[ANIM_COUNT] = {
+    "idle", "walk", "sprint", "crouch",
+    "takeoff", "rise", "apex", "fall", "land",
+    "attack", "hurt", "special",
+};
+
 void fighter_init(Fighter *f, float x, float z)
 {
     f->x = x;
@@ -143,16 +178,21 @@ void fighter_init(Fighter *f, float x, float z)
     f->anim = ANIM_IDLE;
     f->anim_time = 0.0f;
     f->grounded = true;
+    f->air_time = 0.0f;
+    f->land_blend = 0.0f;
     f->sprinting = false;
     f->exhausted = false;
     f->stamina = STAMINA_MAX;
     f->regen_delay = 0.0f;
     f->sprint_blend = 0.0f;
+    f->crouching = false;
+    f->crouch_blend = 0.0f;
     f->attacking = false;
     f->attack_index = 0;
     f->attack_time = 0.0f;
     f->attack_strike = 0.0f;
     f->attack_buffered = false;
+    f->attack_air = false;
     f->chain_grace = 0.0f;
     f->health = 100.0f;
 }
@@ -188,6 +228,7 @@ void fighter_tick(Fighter *f, Input in, const Cheats *cheats)
             f->attack_index = (f->attack_index + 1) % ATTACK_CHAIN;
             f->attack_time = 0.0f;
             f->attack_buffered = false;
+            f->attack_air = !f->grounded;   /* a new swing, so re-read the feet */
         } else if (f->attack_time >= total) {
             f->attacking = false;
             f->attack_buffered = false;
@@ -199,7 +240,10 @@ void fighter_tick(Fighter *f, Input in, const Cheats *cheats)
             if (f->chain_grace <= 0.0f) f->attack_index = 0;   /* chain lapsed */
         }
 
-        if (in.attack && f->grounded) {
+        /* Air attacks use the same chain rather than a separate move: the swing
+         * you have been building on the ground is the swing you take with you
+         * off it, which is one system to reason about instead of two. */
+        if (in.attack) {
             /* Still inside the grace window means this continues the previous
              * chain; otherwise it opens a fresh one. */
             f->attack_index = (f->chain_grace > 0.0f)
@@ -208,6 +252,7 @@ void fighter_tick(Fighter *f, Input in, const Cheats *cheats)
             f->attacking = true;
             f->attack_time = 0.0f;
             f->attack_buffered = false;
+            f->attack_air = !f->grounded;
             f->chain_grace = 0.0f;
         }
     }
@@ -220,8 +265,9 @@ void fighter_tick(Fighter *f, Input in, const Cheats *cheats)
          * rooted to the spot feels weightless no matter how good the pose is. */
         if (f->attack_time >= a->startup &&
             f->attack_time <  a->startup + a->active) {
-            f->vx += sinf(f->facing) * a->lunge * dt;
-            f->vz += cosf(f->facing) * a->lunge * dt;
+            float lunge = a->lunge * (f->attack_air ? AIR_LUNGE_MULT : 1.0f);
+            f->vx += sinf(f->facing) * lunge * dt;
+            f->vz += cosf(f->facing) * lunge * dt;
         }
     } else {
         /* Recovery already returned the curve to 0, so this is continuous. */
@@ -229,10 +275,35 @@ void fighter_tick(Fighter *f, Input in, const Cheats *cheats)
     }
 
     /* --- jump ------------------------------------------------------------ */
-    if (in.jump && f->grounded && !f->attacking) {
+    /* Jumping is not free: it spends from the same bar sprinting does. Being
+     * exhausted grounds you completely, which is the point -- run the bar dry
+     * and you have spent your mobility, not just your top speed. */
+    bool can_afford_jump = infinite
+                        || (!f->exhausted && f->stamina >= JUMP_STAMINA_COST);
+
+    if (in.jump && f->grounded && !f->attacking && can_afford_jump) {
         f->vy = JUMP_SPEED;
         f->grounded = false;
+        f->air_time = 0.0f;
+
+        if (!infinite) {
+            f->stamina -= JUMP_STAMINA_COST;
+            f->regen_delay = STAMINA_REGEN_DELAY;
+            if (f->stamina <= 0.0f) {
+                f->stamina = 0.0f;
+                f->exhausted = true;
+                f->sprinting = false;
+            }
+        }
     }
+
+    /* --- crouch ---------------------------------------------------------- */
+    /* Grounded-only, so a held crouch does nothing in the air. It reads the
+     * ground state from the START of the tick -- contact is not resolved until
+     * gravity runs, below -- so a crouch held through a landing comes back one
+     * tick later. That is 8ms, and keeping the tick in a single order is worth
+     * more than saving it. */
+    f->crouching = in.crouch && f->grounded;
 
     /* --- movement input -------------------------------------------------- */
     float len = sqrtf(in.move_x * in.move_x + in.move_z * in.move_z);
@@ -245,7 +316,8 @@ void fighter_tick(Fighter *f, Input in, const Cheats *cheats)
 
     /* --- sprint decision -------------------------------------------------- */
     if (f->grounded) {
-        bool wants = in.sprint && moving && !f->exhausted && !f->attacking;
+        bool wants = in.sprint && moving && !f->exhausted && !f->attacking
+                  && !f->crouching;
         f->sprinting = wants && (infinite || f->stamina > 0.0f);
     }
     /* While airborne we keep whatever sprint state we launched with, so a
@@ -286,6 +358,11 @@ void fighter_tick(Fighter *f, Input in, const Cheats *cheats)
         turn_rate *= ATTACK_TURN_MULT;
     }
 
+    if (f->crouching) {
+        top_speed *= CROUCH_SPEED_MULT;
+        control   *= CROUCH_ACCEL_MULT;
+    }
+
     if (moving) {
         /* Accelerate toward the target velocity rather than snapping to it. */
         float target_vx = in.move_x * top_speed;
@@ -313,9 +390,24 @@ void fighter_tick(Fighter *f, Input in, const Cheats *cheats)
     f->y  += f->vy * dt;
 
     if (f->y <= 0.0f) {
+        /* Squash in proportion to how hard we arrived, so a hop off the rim and
+         * a drop from the apex do not look like the same landing. */
+        if (!f->grounded) {
+            float impact = fminf(1.0f, -f->vy / JUMP_SPEED);
+            if (impact > f->land_blend) f->land_blend = impact;
+        }
         f->y = 0.0f;
         f->vy = 0.0f;
         f->grounded = true;
+    }
+
+    if (f->grounded) {
+        f->air_time = 0.0f;
+        f->land_blend -= LAND_DECAY_RATE * dt;
+        if (f->land_blend < 0.0f) f->land_blend = 0.0f;
+    } else {
+        f->air_time += dt;
+        f->land_blend = 0.0f;   /* leaving the ground cancels any settle left */
     }
 
     /* --- arena bounds ---------------------------------------------------- */
@@ -336,17 +428,30 @@ void fighter_tick(Fighter *f, Input in, const Cheats *cheats)
     /* --- animation state ------------------------------------------------- */
     float speed = sqrtf(f->vx * f->vx + f->vz * f->vz);
 
-    if (!f->grounded)        set_anim(f, ANIM_JUMP);
-    else if (f->attacking)   set_anim(f, ANIM_ATTACK);
-    else if (f->sprinting)   set_anim(f, ANIM_SPRINT);
-    else if (speed > 0.25f)  set_anim(f, ANIM_WALK);
-    else                     set_anim(f, ANIM_IDLE);
+    /* Attacking outranks everything: it is the thing that just took your
+     * control away, so it is the thing worth naming, in the air or not. */
+    if (f->attacking)                     set_anim(f, ANIM_ATTACK);
+    else if (!f->grounded) {
+        if (f->air_time < TAKEOFF_TIME)   set_anim(f, ANIM_JUMP_TAKEOFF);
+        else if (f->vy >  APEX_VY)        set_anim(f, ANIM_JUMP_RISE);
+        else if (f->vy < -APEX_VY)        set_anim(f, ANIM_JUMP_FALL);
+        else                              set_anim(f, ANIM_JUMP_APEX);
+    }
+    else if (f->land_blend > 0.0f)        set_anim(f, ANIM_LAND);
+    else if (f->crouching)                set_anim(f, ANIM_CROUCH);
+    else if (f->sprinting)                set_anim(f, ANIM_SPRINT);
+    else if (speed > 0.25f)               set_anim(f, ANIM_WALK);
+    else                                  set_anim(f, ANIM_IDLE);
 
-    /* Ease the sprint POSE separately from the sprint STATE, so the body
-     * leans in and out smoothly instead of popping on the tick shift is hit. */
+    /* Ease the sprint and crouch POSES separately from their STATES, so the
+     * body eases in and out instead of popping on the tick the key is hit. */
     float want_blend = f->sprinting ? 1.0f : 0.0f;
     f->sprint_blend += (want_blend - f->sprint_blend)
                      * fminf(SPRINT_BLEND_RATE * dt, 1.0f);
+
+    float want_crouch = f->crouching ? 1.0f : 0.0f;
+    f->crouch_blend += (want_crouch - f->crouch_blend)
+                     * fminf(CROUCH_BLEND_RATE * dt, 1.0f);
 
     /* Advance the walk cycle by DISTANCE, not by time. This is why the legs
      * stay in sync with the ground at any speed instead of skating -- and why
@@ -357,6 +462,14 @@ void fighter_tick(Fighter *f, Input in, const Cheats *cheats)
     }
 
     f->anim_time += dt;
+}
+
+float fighter_attack_impact_time(const Fighter *f)
+{
+    if (!f->attacking) return 0.0f;
+
+    const AttackDef *a = &ATTACKS[f->attack_index];
+    return a->startup + a->active;
 }
 
 Fighter fighter_lerp(const Fighter *a, const Fighter *b, float t)
@@ -375,6 +488,13 @@ Fighter fighter_lerp(const Fighter *a, const Fighter *b, float t)
     r.health       = lerpf(a->health, b->health, t);
     r.stamina      = lerpf(a->stamina, b->stamina, t);
     r.sprint_blend = lerpf(a->sprint_blend, b->sprint_blend, t);
+    r.crouch_blend = lerpf(a->crouch_blend, b->crouch_blend, t);
+    r.air_time     = lerpf(a->air_time, b->air_time, t);
+    /* Landing resets this to its peak, so a naive lerp across the touchdown
+     * tick would smear the squash on. Only ever ease it DOWNWARD. */
+    r.land_blend   = (b->land_blend > a->land_blend)
+                   ? b->land_blend
+                   : lerpf(a->land_blend, b->land_blend, t);
     /* The swing is a smooth curve, so it interpolates like any other pose
      * value. Which swing it is, is not -- that snaps at the chain boundary. */
     r.attack_time   = lerpf(a->attack_time, b->attack_time, t);
@@ -384,9 +504,11 @@ Fighter fighter_lerp(const Fighter *a, const Fighter *b, float t)
     r.grounded     = b->grounded;
     r.sprinting    = b->sprinting;
     r.exhausted    = b->exhausted;
+    r.crouching       = b->crouching;
     r.attacking       = b->attacking;
     r.attack_index    = b->attack_index;
     r.attack_buffered = b->attack_buffered;
+    r.attack_air      = b->attack_air;
     r.chain_grace     = b->chain_grace;
     return r;
 }

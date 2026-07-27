@@ -2,6 +2,7 @@
 #include "settings.h"
 #include "cheats.h"
 #include "frontend.h"
+#include "model.h"
 
 #include "raylib.h"
 
@@ -12,7 +13,7 @@
 #endif
 
 /* Raw key directions, still in camera space: -z is "forward on screen". */
-static Input sample_input(void)
+static Input sample_input(const Settings *s)
 {
     Input in = (Input){ 0 };
 
@@ -22,6 +23,7 @@ static Input sample_input(void)
     if (IsKeyDown(KEY_D)) in.move_x += 1.0f;
 
     in.sprint  = IsKeyDown(KEY_LEFT_SHIFT) || IsKeyDown(KEY_RIGHT_SHIFT);
+    in.crouch  = IsKeyDown(s->crouch_key);
     in.special = IsMouseButtonDown(MOUSE_BUTTON_RIGHT) || IsKeyDown(KEY_K);
     /* in.attack is edge-triggered and latched in the main loop, like jump. */
 
@@ -57,7 +59,9 @@ typedef enum Screen {
     SCREEN_NONE = 0,
     SCREEN_PAUSE,
     SCREEN_SETTINGS,
-    SCREEN_KEYBINDS
+    SCREEN_KEYBINDS,
+    SCREEN_CUSTOMIZE,
+    SCREEN_SKINS        /* one level below customize */
 } Screen;
 
 /* Commit whatever the menus edited: push it into the window and write it to
@@ -79,6 +83,10 @@ int main(void)
     /* Escape belongs to the menus, so it must not also close the window. The
      * only ways out are the Quit button and the title bar X. */
     SetExitKey(KEY_NULL);
+
+    /* Find any skins sitting in assets/ before the save file is read, so a
+     * remembered skin can be matched against what is actually there. */
+    model_scan();
 
     /* `applied` is what the game is actually running with. `pending` is what
      * the menu is editing. They only converge when you press Apply. */
@@ -149,6 +157,10 @@ int main(void)
                 case SCREEN_PAUSE:
                     screen = SCREEN_NONE;
                     break;
+                case SCREEN_SKINS:
+                    /* One level down, so Escape steps back one level. */
+                    screen = SCREEN_CUSTOMIZE;
+                    break;
                 default:                            /* an option page */
                     commit_settings(&applied, &pending);
                     screen = (app == APP_GAME) ? SCREEN_PAUSE : SCREEN_NONE;
@@ -208,12 +220,16 @@ int main(void)
 
             Input in = (Input){ 0 };
             if (playing) {
-                in = sample_input();
+                in = sample_input(&applied);
                 input_to_world(&in, render_camera_yaw());
                 in.jump   = jump_latched;
                 in.attack = attack_latched;
             } else {
-                render_camera_idle_orbit(dt);   /* front-end backdrop drift */
+                /* The appearance pages hand the camera to the player, so the
+                 * backdrop stops drifting while either is open. */
+                bool inspecting = (screen == SCREEN_CUSTOMIZE ||
+                                   screen == SCREEN_SKINS);
+                render_camera_idle_orbit(dt, !inspecting);
             }
 
             while (accumulator >= TICK_DT) {
@@ -231,13 +247,20 @@ int main(void)
 
         /* ---- draw -------------------------------------------------------- */
         HudInfo hud = {
-            .fps_limit = settings_fps_limit(&applied),
-            .vsync     = applied.vsync,
-            .cheat_key = settings_key_name(applied.cheat_key),
+            .fps_limit  = settings_fps_limit(&applied),
+            .vsync      = applied.vsync,
+            .cheat_key  = settings_key_name(applied.cheat_key),
+            .crouch_key = settings_key_name(applied.crouch_key),
         };
 
+        /* While an appearance page is open the world is drawn with the hero
+         * being EDITED rather than the one in force, which is what makes the
+         * fighter standing in the arena behind the panel a live preview. */
+        const Hero *shown = (screen == SCREEN_CUSTOMIZE || screen == SCREEN_SKINS)
+                          ? &pending.hero : &applied.hero;
+
         render_begin();
-            render_world(&prev, &curr, alpha);
+            render_world(&prev, &curr, alpha, shown);
 
             /* The HUD belongs to the game, not to the title screen. */
             if (app == APP_GAME) render_hud(&curr, alpha, &hud, &cheats);
@@ -261,6 +284,10 @@ int main(void)
                         app = APP_GAME;
                         break;
                     case MENU_QUIT: quit = true; break;
+                    case MENU_OPEN_CUSTOMIZE:
+                        pending = applied;
+                        screen = SCREEN_CUSTOMIZE;
+                        break;
                     case MENU_OPEN_SETTINGS:
                         pending = applied;
                         screen = SCREEN_SETTINGS;
@@ -298,10 +325,16 @@ int main(void)
                 break;
 
             case SCREEN_SETTINGS:
-            case SCREEN_KEYBINDS: {
+            case SCREEN_KEYBINDS:
+            case SCREEN_CUSTOMIZE:
+            case SCREEN_SKINS: {
                 MenuAction a = (screen == SCREEN_SETTINGS)
                              ? settings_menu(&pending, &applied)
-                             : keybinds_menu(&pending, &applied);
+                             : (screen == SCREEN_KEYBINDS)
+                             ? keybinds_menu(&pending, &applied)
+                             : (screen == SCREEN_CUSTOMIZE)
+                             ? customize_menu(&pending.hero, &applied.hero)
+                             : modskins_menu(&pending.hero, &applied.hero);
                 switch (a) {
                 case MENU_APPLY:
                     commit_settings(&applied, &pending);
@@ -312,10 +345,18 @@ int main(void)
                 case MENU_REVERT:
                     pending = applied;
                     break;
+                case MENU_OPEN_SKINS:
+                    /* Deeper, not sideways: the mod list keeps the edits the
+                     * page above it has already made. */
+                    screen = SCREEN_SKINS;
+                    break;
                 case MENU_BACK:
-                    commit_settings(&applied, &pending);
-                    /* Back to whichever menu sent us here. */
-                    screen = (app == APP_GAME) ? SCREEN_PAUSE : SCREEN_NONE;
+                    if (screen == SCREEN_SKINS) {
+                        screen = SCREEN_CUSTOMIZE;   /* back one level */
+                    } else {
+                        commit_settings(&applied, &pending);
+                        screen = (app == APP_GAME) ? SCREEN_PAUSE : SCREEN_NONE;
+                    }
                     break;
                 default: break;
                 }
@@ -328,6 +369,7 @@ int main(void)
         render_end();
     }
 
+    model_unload();     /* before the GL context goes away */
     CloseWindow();
     return 0;
 }

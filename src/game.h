@@ -23,11 +23,27 @@
  * height, driven only by jumping and gravity. */
 #define ARENA_RADIUS 12.0f
 
+/* ---------------------------------------------------------------------------
+ * How big a fighter is. One number, owned by the SIMULATION.
+ *
+ * Every fighter is this tall, always. Appearance must never change it: an
+ * imported skin is scaled to this height when it loads, precisely so that
+ * picking a bigger model cannot buy you a bigger body -- and so that when
+ * hitboxes arrive they measure this constant rather than whatever mesh happens
+ * to be drawn. A skin is a costume, not a stat.
+ * ------------------------------------------------------------------------- */
+#define FIGHTER_HEIGHT 1.90f
+
 /* Jump. Apex = JUMP_SPEED^2 / (2 * GRAVITY) ~= 1.33 units, on a character
  * about 1.9 units tall. Air time ~= 0.67s -- snappy rather than floaty.
  * Shared because the renderer normalises the airborne pose by JUMP_SPEED. */
 #define GRAVITY     24.0f
 #define JUMP_SPEED   8.0f
+
+/* Walking top speed. Simulation-owned; shared because imported movement clips
+ * are paced against it -- a clip plays at its authored rate at exactly this
+ * ground speed (see model.c). */
+#define MOVE_MAX     6.0f
 
 /* Sprint: 18% above walking top speed. */
 #define SPRINT_MULT  1.18f
@@ -36,6 +52,12 @@
 #define STAMINA_MAX          100.0f
 #define STAMINA_EXHAUST_AT    30.0f  /* must recover to here before sprinting again */
 
+/* A jump spends from the SAME pool as sprinting, so mobility is one budget
+ * rather than two: you cannot hop your way across the arena while the bar is
+ * empty, and every jump is stride you are not going to run. Five jumps from
+ * full. Shared because the HUD marks the threshold on the bar. */
+#define JUMP_STAMINA_COST     20.0f
+
 /* Melee attacks come in a fixed-order chain rather than a random pick -- see
  * the long comment in fighter.c for why. The renderer needs the count so it can
  * pose each swing differently. */
@@ -43,16 +65,32 @@
 
 /* ------------------------------- animation ------------------------------- */
 
+/*
+ * What the fighter is doing, as the SIMULATION sees it. The renderer does not
+ * switch on this: it builds poses out of continuous quantities (velocity, the
+ * eased blends, the strike curve) so the phases flow into each other instead of
+ * popping at the boundaries. This enum is the simulation naming those same
+ * phases -- for the HUD readout, for tests, and for the hit reactions that will
+ * need to know what they interrupted.
+ */
 typedef enum AnimState {
     ANIM_IDLE = 0,
     ANIM_WALK,
     ANIM_SPRINT,
-    ANIM_JUMP,
+    ANIM_CROUCH,
+    ANIM_JUMP_TAKEOFF,   /* the push-off, first fraction of a second airborne */
+    ANIM_JUMP_RISE,
+    ANIM_JUMP_APEX,      /* the hang at the top, where vy is near zero        */
+    ANIM_JUMP_FALL,
+    ANIM_LAND,           /* the squash on touchdown; never takes control away */
     ANIM_ATTACK,
     ANIM_HURT,
     ANIM_SPECIAL,
     ANIM_COUNT
 } AnimState;
+
+/* Names for the HUD readout, indexed by AnimState. */
+extern const char *const ANIM_NAMES[ANIM_COUNT];
 
 /* -------------------------------- cheats --------------------------------- */
 
@@ -72,6 +110,8 @@ typedef struct Fighter {
     float anim_time;    /* seconds spent in the current animation           */
 
     bool  grounded;
+    float air_time;     /* seconds since the feet left the ground            */
+    float land_blend;   /* 0..1 landing squash, set by impact, decays to 0   */
 
     /* sprint / stamina */
     bool  sprinting;
@@ -80,12 +120,18 @@ typedef struct Fighter {
     float regen_delay;  /* seconds left before stamina starts coming back    */
     float sprint_blend; /* 0..1 eased, drives the animation only             */
 
+    /* crouch */
+    bool  crouching;
+    float crouch_blend; /* 0..1 eased, drives the animation only             */
+
     /* melee attack chain */
     bool  attacking;
     int   attack_index;    /* which swing of the chain, 0..ATTACK_CHAIN-1     */
     float attack_time;     /* seconds into the current swing                  */
     float attack_strike;   /* pose driver: <0 winding up, 1 = impact, 0 rest  */
     bool  attack_buffered; /* a press that landed too early to chain yet      */
+    bool  attack_air;      /* this swing started airborne -- latched, so it   */
+                           /* does not change shape when you land mid-swing   */
     float chain_grace;     /* seconds the finished chain stays "continuable"  */
 
     float health;
@@ -100,6 +146,7 @@ typedef struct Input {
     bool  special;
     bool  jump;         /* edge-triggered: true only on the tick that jumps */
     bool  sprint;       /* held                                             */
+    bool  crouch;       /* held                                             */
 } Input;
 
 /* ------------------------------- world ----------------------------------- */
@@ -114,6 +161,12 @@ void  fighter_init(Fighter *f, float x, float z);
 void  fighter_tick(Fighter *f, Input in, const Cheats *cheats);
 Fighter fighter_lerp(const Fighter *a, const Fighter *b, float t);
 
+/* Seconds into the current swing at which the strike lands (the end of the
+ * ACTIVE window), or 0 when not attacking. The renderer anchors an imported
+ * attack clip's contact frame to this moment, so the hit still reads on the
+ * simulation's hit window however long the clip was authored. */
+float fighter_attack_impact_time(const Fighter *f);
+
 void  world_init(World *w);
 void  world_tick(World *w, Input in, const Cheats *cheats);
 
@@ -122,13 +175,18 @@ void  world_tick(World *w, Input in, const Cheats *cheats);
  * optional menu overlay, all inside one Begin/EndDrawing pair. */
 void  render_init(void);
 void  render_begin(void);
-void  render_world(const World *prev, const World *curr, float alpha);
+/* `hero` is presentation only -- which skin, colours and size to draw with. It
+ * never reaches the simulation. */
+struct Hero;
+void  render_world(const World *prev, const World *curr, float alpha,
+                   const struct Hero *hero);
 /* Everything the HUD needs that is not part of the simulation. Passed as a
  * struct so adding a readout later does not mean another positional argument. */
 typedef struct HudInfo {
     int         fps_limit;      /* 0 = unlimited */
     bool        vsync;
     const char *cheat_key;      /* label for the help line, e.g. "Tab" */
+    const char *crouch_key;     /* likewise, e.g. "L Ctrl"             */
 } HudInfo;
 
 void  render_hud(const World *w, float alpha, const HudInfo *info,
@@ -140,8 +198,14 @@ void  render_end(void);
 void  render_camera_look(float dx, float dy, float sensitivity);
 float render_camera_yaw(void);
 
-/* Slow automatic drift, for the intro and the main menu where there is no
- * mouselook. Takes wall-clock seconds: it moves the camera, never the world. */
-void  render_camera_idle_orbit(float dt);
+/* Front-end framing: parks the fighter to one side of the menu, and with
+ * `drift` set also turns slowly for the title backdrop. Wall-clock seconds --
+ * it moves the camera, never the world. */
+void  render_camera_idle_orbit(float dt, bool drift);
+
+/* Orbit and zoom by hand, for the customize pages. Call it every frame the page
+ * is open, with zeroes when the player is not dragging: the zoom is held only
+ * while it is being asked for, and eases back out when it is not. */
+void  render_camera_inspect(float dx, float dy, float wheel, float sensitivity);
 
 #endif /* GAME_H */

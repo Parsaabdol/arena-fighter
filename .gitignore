@@ -14,6 +14,15 @@ ArenaFighter.exe
 # Written next to the executable at runtime. Per-machine, not source.
 settings.dat
 
+# --- character skins ------------------------------------------------------
+# Scanned at runtime for .glb/.gltf. Deliberately NEVER tracked: whatever you
+# drop in here is somebody else's art, and this repository is public and MIT
+# licensed -- committing a model would be redistributing it under a licence we
+# have no right to grant. Non-commercial and personal use is a question between
+# you and whoever made the file; publishing it is not. The game runs with this
+# folder empty and falls back to the built-in fighter.
+assets/
+
 # --- private working notes ------------------------------------------------
 # Internal aids, not part of the published project. They live in the working
 # tree on purpose (CLAUDE.md is only picked up from the project root) but are

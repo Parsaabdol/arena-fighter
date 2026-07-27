@@ -64,7 +64,9 @@ void settings_default(Settings *s)
     s->display_mode = DISPLAY_WINDOWED;
     s->sens_index   = SENS_DEFAULT_INDEX;
     s->cheat_key    = KEY_TAB;
+    s->crouch_key   = KEY_LEFT_CONTROL;
     s->vsync        = false;
+    hero_default(&s->hero);
 }
 
 /* raylib has no key-name function, so here is a small one. Letters and digits
@@ -133,7 +135,9 @@ bool settings_equal(const Settings *a, const Settings *b)
         && a->display_mode == b->display_mode
         && a->sens_index   == b->sens_index
         && a->cheat_key    == b->cheat_key
-        && a->vsync        == b->vsync;
+        && a->crouch_key   == b->crouch_key
+        && a->vsync        == b->vsync
+        && hero_equal(&a->hero, &b->hero);
 }
 
 /* --------------------------- applying to window -------------------------- */
@@ -210,7 +214,8 @@ void settings_apply_all(const Settings *s)
  */
 
 #define SAVE_MAGIC   0x31465241u   /* "ARF1" little-endian */
-#define SAVE_VERSION 2u            /* v2 added cheat_key */
+#define SAVE_VERSION 5u            /* v2 cheat_key, v3 crouch_key, v4 hero,
+                                    * v5 dropped hero size (see hero.h) */
 
 typedef struct SettingsRecord {
     uint32_t magic;
@@ -221,6 +226,12 @@ typedef struct SettingsRecord {
     int32_t  sens_index;
     int32_t  vsync;
     int32_t  cheat_key;            /* added in v2 */
+    int32_t  crouch_key;           /* added in v3 */
+    /* Hero, added in v4. The skin is stored as a NAME, not as an index into
+     * whatever happened to be in assets/ when it was saved. */
+    char     hero_model[HERO_NAME_MAX];
+    int32_t  hero_body;
+    int32_t  hero_accent;
     uint32_t checksum;
 } SettingsRecord;
 
@@ -251,7 +262,10 @@ static int clampi(int v, int lo, int hi)
 
 bool settings_save(const Settings *s)
 {
-    SettingsRecord r;
+    /* Zeroed first: the record is hashed byte by byte, and the padding around
+     * the hero name would otherwise be whatever was on the stack -- a checksum
+     * that changes for a file that did not. */
+    SettingsRecord r = { 0 };
     r.magic        = SAVE_MAGIC;
     r.version      = SAVE_VERSION;
     r.fps_index    = s->fps_index;
@@ -260,6 +274,10 @@ bool settings_save(const Settings *s)
     r.sens_index   = s->sens_index;
     r.vsync        = s->vsync ? 1 : 0;
     r.cheat_key    = s->cheat_key;
+    r.crouch_key   = s->crouch_key;
+    snprintf(r.hero_model, sizeof r.hero_model, "%s", s->hero.model);
+    r.hero_body    = s->hero.body_index;
+    r.hero_accent  = s->hero.accent_index;
     r.checksum     = record_checksum(&r);
 
     FILE *f = fopen(save_path(), "wb");
@@ -292,9 +310,20 @@ bool settings_load(Settings *s)
     s->display_mode = clampi(r.display_mode, 0, DISPLAY_MODE_COUNT - 1);
     s->sens_index   = clampi(r.sens_index,   0, SENS_COUNT - 1);
     s->vsync        = (r.vsync != 0);
-    /* A nonsense keycode would leave the cheat menu permanently unreachable,
-     * so fall back to the default rather than trusting it. */
-    s->cheat_key    = (r.cheat_key > 0 && r.cheat_key < 400) ? r.cheat_key : KEY_TAB;
+    /* A nonsense keycode would leave the cheat menu permanently unreachable --
+     * or crouching unbindable -- so fall back to the default rather than
+     * trusting it. */
+    s->cheat_key    = (r.cheat_key  > 0 && r.cheat_key  < 400) ? r.cheat_key  : KEY_TAB;
+    s->crouch_key   = (r.crouch_key > 0 && r.crouch_key < 400) ? r.crouch_key
+                                                               : KEY_LEFT_CONTROL;
+
+    /* The saved skin may simply not be on this machine any more. Keep the name
+     * either way -- the model layer falls back to the built-in fighter on its
+     * own, and putting the file back restores the choice. */
+    r.hero_model[HERO_NAME_MAX - 1] = '\0';   /* untrusted: force termination */
+    snprintf(s->hero.model, sizeof s->hero.model, "%s", r.hero_model);
+    s->hero.body_index   = clampi(r.hero_body,   0, hero_color_count() - 1);
+    s->hero.accent_index = clampi(r.hero_accent, 0, hero_color_count() - 1);
     return true;
 }
 
@@ -306,8 +335,10 @@ static const char *fps_label(int index)
     return (v == 0) ? "Unlimited" : TextFormat("%i FPS", v);
 }
 
-/* True while the rebind row is swallowing the next keypress. */
+/* True while a rebind row is swallowing the next keypress, and which row it is
+ * (the address of the key it edits). */
 static bool g_capturing;
+static const void *g_capture_target;
 
 bool settings_is_rebinding(void)
 {
@@ -478,13 +509,18 @@ MenuAction settings_menu(Settings *pending, const Settings *applied)
 /* ------------------------------- keybinds -------------------------------- */
 
 /* One rebindable row: a label on the left and a button showing the current key
- * that turns into a capture box when clicked. */
+ * that turns into a capture box when clicked.
+ *
+ * With more than one row on the page, "am I capturing?" is no longer enough --
+ * every row would light up at once. `target` names WHICH row owns the capture,
+ * using the address of the key it edits, the same trick ui.c uses for the
+ * widget that owns the mouse. */
 static void keybind_row(Rectangle r, const char *label, int *key,
-                        float label_x, bool *capturing)
+                        float label_x, bool *capturing, const void **target)
 {
     ui_text((int)label_x, (int)(r.y + 8), 18, label, UI_MUTED);
 
-    if (*capturing) {
+    if (*capturing && *target == key) {
         DrawRectangleRounded(r, 0.28f, 6, Fade(UI_ACCENT, 0.22f));
         DrawRectangleRoundedLines(r, 0.28f, 6, UI_ACCENT);
         ui_text_center(r, 18, "Press a key...   (Esc cancels)", UI_ACCENT);
@@ -497,7 +533,12 @@ static void keybind_row(Rectangle r, const char *label, int *key,
             else { *key = k; *capturing = false; }
         }
     } else {
-        if (ui_button(r, settings_key_name(*key), false, true)) *capturing = true;
+        /* While another row is waiting for a key, this one cannot start its own
+         * capture -- the next keypress already belongs to somebody. */
+        if (ui_button(r, settings_key_name(*key), false, !*capturing)) {
+            *capturing = true;
+            *target = key;
+        }
     }
 }
 
@@ -506,7 +547,7 @@ MenuAction keybinds_menu(Settings *pending, const Settings *applied)
     MenuAction action = MENU_NONE;
     bool dirty = !settings_equal(pending, applied);
 
-    Rectangle panel = panel_begin("KEYBINDS", 520.0f, 300.0f);
+    Rectangle panel = panel_begin("KEYBINDS", 520.0f, 348.0f);
 
     const float pad   = 32.0f;
     const float lbl_w = 170.0f;
@@ -514,13 +555,27 @@ MenuAction keybinds_menu(Settings *pending, const Settings *applied)
     const float ctl_w = panel.width - pad * 2.0f - lbl_w;
     float y = panel.y + 84.0f;
 
+    /* Only one row may capture at a time, so the pages share one flag: the row
+     * that is not capturing simply draws its key as a button. */
+    keybind_row((Rectangle){ ctl_x, y, ctl_w, 34.0f }, "Crouch",
+                &pending->crouch_key, panel.x + pad,
+                &g_capturing, &g_capture_target);
+    y += 48.0f;
+
     keybind_row((Rectangle){ ctl_x, y, ctl_w, 34.0f }, "Cheat Menu",
-                &pending->cheat_key, panel.x + pad, &g_capturing);
-    y += 44.0f;
+                &pending->cheat_key, panel.x + pad,
+                &g_capturing, &g_capture_target);
+    y += 48.0f;
 
     ui_text((int)(panel.x + pad), (int)y, 14,
-            "Movement is fixed to WASD, Space and Shift for now.",
+            "The rest is fixed for now: WASD moves, Space jumps, Shift sprints.",
             Fade(UI_MUTED, 0.75f));
+    y += 22.0f;
+
+    /* Nothing stops you binding both to the same key, but you should be told. */
+    if (pending->crouch_key == pending->cheat_key)
+        ui_text((int)(panel.x + pad), (int)y, 14,
+                "Both actions share a key -- both will fire.", UI_DANGER);
 
     /* --- back ------------------------------------------------------------ */
     {

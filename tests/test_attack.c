@@ -138,14 +138,37 @@ int main(void)
         check("the swing steps forward", f.z > z0 + 0.02f);
     }
 
-    /* --- airborne cannot start an attack -------------------------------- */
+    /* --- attacks work in the air, and know that they are ---------------- */
     {
         Fighter f; fighter_init(&f, 0, 0);
         Input jump = (Input){ 0 }; jump.jump = true;
         fighter_tick(&f, jump, NULL);
         check("airborne", !f.grounded);
+
         fighter_tick(&f, press_attack(), NULL);
-        check("no attack starts in the air", !f.attacking);
+        check("an attack starts in the air", f.attacking);
+        check("the swing is flagged as an air swing", f.attack_air);
+
+        /* The lunge is cut in the air, so a swing cannot be ridden across the
+         * arena. Compare the same swing taken from a standstill on the ground. */
+        Fighter g; fighter_init(&g, 0, 0);
+        fighter_tick(&g, press_attack(), NULL);
+        check("a ground swing is not flagged as an air swing", !g.attack_air);
+
+        /* Peak speed rather than distance travelled: the ground fighter is
+         * fighting friction and the airborne one is not, so displacement would
+         * be measuring two things at once. */
+        float air_peak = 0.0f, ground_peak = 0.0f;
+        for (int i = 0; i < 20; i++) {
+            fighter_tick(&f, none(), NULL);
+            fighter_tick(&g, none(), NULL);
+            if (f.vz > air_peak)    air_peak = f.vz;
+            if (g.vz > ground_peak) ground_peak = g.vz;
+        }
+        printf("   lunge peak: ground %.3f  air %.3f\n",
+               (double)ground_peak, (double)air_peak);
+        check("the air swing lunges less than the ground one",
+              air_peak > 0.0f && air_peak < ground_peak);
     }
 
     /* --- determinism: same inputs, same result -------------------------- */

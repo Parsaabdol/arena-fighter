@@ -23,7 +23,7 @@ REM /MD  dynamic CRT -- MUST match the prebuilt raylib.lib, which was compiled
 REM      with /DEFAULTLIB:MSVCRT (verified with `dumpbin /directives raylib.lib`).
 REM      Mismatching this is the classic "unresolved __imp_*" link error.
 cl /nologo /std:c17 /O2 /GL /fp:fast /MD /W4 /wd4996 ^
-   /I"%RAYLIB%\include" ^
+   /I"%RAYLIB%\include" /I"%ROOT%vendor\cgltf" ^
    "%ROOT%src\*.c" ^
    /Fe:"%ROOT%ArenaFighter.exe" ^
    /link /LTCG /INCREMENTAL:NO /LIBPATH:"%RAYLIB%\lib" ^

@@ -1,7 +1,11 @@
 #include "frontend.h"
+#include "game.h"     /* the inspection camera */
+#include "model.h"
 #include "ui.h"
 
 #include "raylib.h"
+
+#include <stdio.h>    /* snprintf */
 
 /* ---------------------------------------------------------------------------
  * Shared title treatment.
@@ -230,6 +234,9 @@ MenuAction main_menu(void)
         action = MENU_PLAY;
     r.y += MM_BTN_H + MM_BTN_GAP;
 
+    if (ui_button(r, "Customize", false, true)) action = MENU_OPEN_CUSTOMIZE;
+    r.y += MM_BTN_H + MM_BTN_GAP;
+
     if (ui_button(r, "Settings", false, true)) action = MENU_OPEN_SETTINGS;
     r.y += MM_BTN_H + MM_BTN_GAP;
 
@@ -245,5 +252,255 @@ MenuAction main_menu(void)
     ui_text(sw - MeasureText(hint, 14) - 24, sh - 34, 14, hint,
             Fade(UI_MUTED, 0.55f));
 
+    return action;
+}
+
+/* ---------------------------------------------------------------------------
+ * Customize
+ *
+ * The panel sits well left of centre on purpose: the front-end camera parks the
+ * fighter on the right of the frame, so leaving that side clear turns the whole
+ * screen into the preview. No second viewport, no second copy of the character
+ * -- you are looking at the real one, under the real camera, which you can
+ * drag to orbit and scroll to zoom.
+ * ------------------------------------------------------------------------- */
+
+#define CZ_PANEL_W   430.0f
+#define CZ_INSPECT_SENS 0.006f   /* radians per pixel dragged */
+
+/* Panel chrome shared by both appearance pages, so the one that is one level
+ * down looks like the same place rather than a different screen. */
+static Rectangle appearance_panel(const char *title, float ph)
+{
+    int sw = GetScreenWidth();
+    int sh = GetScreenHeight();
+
+    /* Lighter than the settings dim: the whole point here is to see him. */
+    DrawRectangle(0, 0, sw, sh, Fade(BLACK, 0.45f));
+
+    float px = (float)sw * 0.06f;
+    if (px + CZ_PANEL_W > (float)sw - 24.0f) px = 24.0f;   /* narrow window */
+
+    Rectangle panel = { px, ((float)sh - ph) * 0.5f, CZ_PANEL_W, ph };
+    DrawRectangleRounded(panel, 0.04f, 8, UI_BG);
+    DrawRectangleRoundedLines(panel, 0.04f, 8, UI_BORDER);
+    ui_text_center((Rectangle){ panel.x, panel.y + 18.0f, panel.width, 34.0f },
+                   26, title, UI_TEXT);
+    return panel;
+}
+
+/*
+ * Let the player turn the character over. Dragging anywhere OUTSIDE the panel
+ * orbits and the wheel zooms -- outside, so a drag can never be mistaken for a
+ * slider, and so the whole empty half of the screen is a handle.
+ */
+static void inspect_camera(Rectangle panel)
+{
+    Vector2 m = GetMousePosition();
+    bool over_panel = CheckCollisionPointRec(m, panel);
+
+    float dx = 0.0f, dy = 0.0f, wheel = 0.0f;
+    if (!over_panel) {
+        if (IsMouseButtonDown(MOUSE_BUTTON_LEFT)) {
+            Vector2 d = GetMouseDelta();
+            dx = d.x;
+            dy = d.y;
+        }
+        wheel = GetMouseWheelMove();
+    }
+
+    /* Called every frame the page is open, moving or not: the zoom is held
+     * only while it is asked for, and eases back out when it is not. */
+    render_camera_inspect(dx, dy, wheel, CZ_INSPECT_SENS);
+}
+
+static void appearance_footer(const Hero *pending, const Hero *applied)
+{
+    int sw = GetScreenWidth();
+    int sh = GetScreenHeight();
+
+    ui_text(24, sh - 34, 14, "Drag to turn him around   ·   Scroll to zoom",
+            Fade(UI_MUTED, 0.6f));
+
+    if (!hero_equal(pending, applied)) {
+        const char *s = "Saved when you go back";
+        ui_text(sw - MeasureText(s, 14) - 24, sh - 34, 14, s,
+                Fade(UI_ACCENT, 0.95f));
+    }
+}
+
+MenuAction customize_menu(Hero *pending, const Hero *applied)
+{
+    MenuAction action = MENU_NONE;
+
+    ui_begin();
+
+    Rectangle panel = appearance_panel("CUSTOMIZE", 340.0f);
+    inspect_camera(panel);
+
+    const float pad   = 28.0f;
+    const float lbl_w = 100.0f;
+    const float ctl_x = panel.x + pad + lbl_w;
+    const float ctl_w = panel.width - pad * 2.0f - lbl_w;
+    float y = panel.y + 76.0f;
+
+    /* An imported mesh brings its own materials, so only the overall tint has
+     * anywhere to land -- the two-colour scheme is the built-in model's. */
+    bool mesh = (pending->model[0] != '\0') && model_is_mesh();
+
+    ui_text((int)(panel.x + pad), (int)(y + 8), 18, "Colour", UI_MUTED);
+    {
+        Rectangle cr = { ctl_x, y, ctl_w - 46.0f, 34.0f };
+        ui_cycler(cr, &pending->body_index, hero_color_count(),
+                  hero_color_names(), true);
+        /* A swatch, because a colour name is a poor way to pick a colour. */
+        Rectangle sr = { ctl_x + ctl_w - 36.0f, y + 3.0f, 28.0f, 28.0f };
+        DrawRectangleRounded(sr, 0.3f, 6, hero_color(pending->body_index));
+        DrawRectangleRoundedLines(sr, 0.3f, 6, UI_BORDER);
+    }
+    y += 46.0f;
+
+    ui_text((int)(panel.x + pad), (int)(y + 8), 18, "Accent",
+            mesh ? Fade(UI_MUTED, 0.45f) : UI_MUTED);
+    {
+        Rectangle cr = { ctl_x, y, ctl_w - 46.0f, 34.0f };
+        ui_cycler(cr, &pending->accent_index, hero_color_count(),
+                  hero_color_names(), !mesh);
+        Rectangle sr = { ctl_x + ctl_w - 36.0f, y + 3.0f, 28.0f, 28.0f };
+        DrawRectangleRounded(sr, 0.3f, 6,
+                             Fade(hero_color(pending->accent_index),
+                                  mesh ? 0.35f : 1.0f));
+        DrawRectangleRoundedLines(sr, 0.3f, 6, UI_BORDER);
+    }
+    y += 40.0f;
+
+    ui_text((int)ctl_x, (int)y, 14,
+            mesh ? "Imported skins are tinted by Colour alone"
+                 : "The built-in fighter uses both",
+            Fade(UI_MUTED, 0.7f));
+    y += 30.0f;
+
+    /* --- the way one level down ------------------------------------------ */
+    {
+        int installed = model_count() - 1;      /* entry 0 is the built-in */
+        const char *current = (pending->model[0] == '\0')
+                            ? "Built-in blocks"
+                            : model_label(model_index_of(pending->model));
+
+        Rectangle br = { panel.x + pad, y, panel.width - pad * 2.0f, 42.0f };
+        if (ui_button(br, "Mod Skins", false, true)) action = MENU_OPEN_SKINS;
+        y += 46.0f;
+
+        ui_text((int)(panel.x + pad), (int)y, 14,
+                TextFormat("%s   ·   %i installed",
+                           (pending->model[0] && model_index_of(pending->model) < 0)
+                               ? pending->model : current,
+                           installed),
+                Fade(UI_MUTED, 0.7f));
+    }
+
+    /* --- buttons --------------------------------------------------------- */
+    {
+        float bw = (panel.width - pad * 2.0f - 14.0f) * 0.5f;
+        float by = panel.y + panel.height - 58.0f;
+
+        if (ui_button((Rectangle){ panel.x + pad, by, bw, 40.0f },
+                      "Restore Defaults", false, true))
+            hero_default(pending);
+
+        if (ui_button((Rectangle){ panel.x + pad + bw + 14.0f, by, bw, 40.0f },
+                      "Back", false, true))
+            action = MENU_BACK;
+    }
+
+    appearance_footer(pending, applied);
+    return action;
+}
+
+/* ------------------------------- mod skins -------------------------------- */
+
+#define MS_ROWS_MAX  10          /* rows the panel has room for */
+#define MS_ROW_H     36.0f
+#define MS_ROW_GAP    6.0f
+
+MenuAction modskins_menu(Hero *pending, const Hero *applied)
+{
+    MenuAction action = MENU_NONE;
+
+    ui_begin();
+
+    int total = model_count();
+    int n = (total > MS_ROWS_MAX) ? MS_ROWS_MAX : total;
+
+    float ph = 150.0f + (float)n * (MS_ROW_H + MS_ROW_GAP);
+    Rectangle panel = appearance_panel("MOD SKINS", ph);
+    inspect_camera(panel);
+
+    const float pad = 28.0f;
+    float y = panel.y + 66.0f;
+
+    int selected = model_index_of(pending->model);
+
+    for (int i = 0; i < n; i++) {
+        Rectangle r = { panel.x + pad, y, panel.width - pad * 2.0f, MS_ROW_H };
+
+        /* The active skin gets a filled backdrop and says so; ui_button's own
+         * fill is translucent and layers over it, which is cheaper than
+         * teaching the widget about a selected state. It stays ENABLED --
+         * greying out the row you are using reads as "unavailable" rather than
+         * "current", and clicking it again is harmless. */
+        bool active = (i == selected);
+        if (active) DrawRectangleRounded(r, 0.25f, 6, Fade(UI_ACCENT, 0.22f));
+
+        const char *label = active ? TextFormat("%s   (active)", model_label(i))
+                                   : model_label(i);
+        if (ui_button(r, label, false, true))
+            snprintf(pending->model, HERO_NAME_MAX, "%s", model_file(i));
+
+        y += MS_ROW_H + MS_ROW_GAP;
+    }
+
+    y += 4.0f;
+
+    if (total == 1) {
+        ui_text((int)(panel.x + pad), (int)y, 14,
+                "Nothing installed yet -- drop a .glb in assets/",
+                Fade(UI_MUTED, 0.75f));
+    } else if (total > MS_ROWS_MAX) {
+        ui_text((int)(panel.x + pad), (int)y, 14,
+                TextFormat("Showing %i of %i -- the rest are ignored for now",
+                           n, total),
+                Fade(UI_MUTED, 0.75f));
+    } else if (selected < 0) {
+        ui_text((int)(panel.x + pad), (int)y, 14,
+                TextFormat("\"%s\" is missing; the built-in is drawn",
+                           pending->model),
+                Fade(UI_DANGER, 0.95f));
+    } else if (pending->model[0] && !model_is_mesh()) {
+        ui_text((int)(panel.x + pad), (int)y, 14,
+                "That file could not be loaded", Fade(UI_DANGER, 0.95f));
+    } else if (model_is_mesh()) {
+        /* Loading and animating are different kinds of success, and an export
+         * can easily manage only the first -- so say which one happened. */
+        int clips = model_clip_count();
+        if (clips == 0) {
+            ui_text((int)(panel.x + pad), (int)y, 14,
+                    "No animations in this file -- it will stand still",
+                    Fade(UI_DANGER, 0.95f));
+        } else {
+            ui_text((int)(panel.x + pad), (int)y, 14,
+                    TextFormat("%i clips   ·   %i of %i states matched by name",
+                               clips, model_matched_count(), (int)ANIM_COUNT),
+                    Fade(UI_MUTED, 0.75f));
+        }
+    }
+
+    {
+        Rectangle br = { panel.x + pad, panel.y + panel.height - 56.0f,
+                         panel.width - pad * 2.0f, 40.0f };
+        if (ui_button(br, "Back", false, true)) action = MENU_BACK;
+    }
+
+    appearance_footer(pending, applied);
     return action;
 }

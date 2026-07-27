@@ -1,4 +1,6 @@
 #include "game.h"
+#include "hero.h"
+#include "model.h"
 
 #include "raylib.h"
 #include "rlgl.h"
@@ -18,6 +20,11 @@ static Vector3  g_cam_look;      /* smoothed point the camera aims at */
 #define PITCH_MAX 1.30f          /* near straight down     ~74 deg        */
 #define CAM_DIST  9.5f
 
+/* How close and far the inspection view may pull. Gameplay always sits at
+ * CAM_DIST -- the zoom is a front-end affordance, not a camera setting. */
+#define ZOOM_MIN  -5.0f
+#define ZOOM_MAX   4.0f
+
 /* Orbit angles, driven by the mouse. */
 static float g_yaw   = 0.0f;     /* radians; 0 puts the camera on +z      */
 static float g_pitch = PITCH_DEFAULT;
@@ -34,6 +41,13 @@ static float g_pitch = PITCH_DEFAULT;
 
 static float g_look_side;        /* current offset, eased                 */
 static float g_look_side_want;   /* re-asserted every front-end frame     */
+
+/* Inspection zoom, in world units added to CAM_DIST. Held while the customize
+ * pages ask for it and eased away once they stop, the same one-frame latch the
+ * lateral offset uses -- so gameplay is never left zoomed. */
+static float g_zoom;
+static float g_zoom_want;
+static bool  g_inspecting;
 
 /* ------------------------------------------------------------------------ */
 
@@ -84,13 +98,26 @@ static float smooth(float current, float target, float rate, float dt)
  * same time, which means returning from a run that ended with the camera
  * pointing at the floor tidies itself up -- and pressing Play needs no reset,
  * because the camera is already where gameplay wants it. */
-void render_camera_idle_orbit(float dt)
+void render_camera_idle_orbit(float dt, bool drift)
 {
-    g_yaw += IDLE_ORBIT_RATE * dt;
-    if (g_yaw > PI_F) g_yaw -= 2.0f * PI_F;
-
-    g_pitch = smooth(g_pitch, PITCH_DEFAULT, 2.5f, dt);
+    /* The customize pages turn the drift off: once you are inspecting a model,
+     * a camera that keeps wandering is fighting you. */
+    if (drift) {
+        g_yaw += IDLE_ORBIT_RATE * dt;
+        if (g_yaw > PI_F) g_yaw -= 2.0f * PI_F;
+        g_pitch = smooth(g_pitch, PITCH_DEFAULT, 2.5f, dt);
+    }
     g_look_side_want = IDLE_LOOK_SIDE;
+}
+
+void render_camera_inspect(float dx, float dy, float wheel, float sensitivity)
+{
+    render_camera_look(dx, dy, sensitivity);
+
+    g_zoom_want = g_zoom_want - wheel;    /* wheel up pulls the camera in */
+    if (g_zoom_want < ZOOM_MIN) g_zoom_want = ZOOM_MIN;
+    if (g_zoom_want > ZOOM_MAX) g_zoom_want = ZOOM_MAX;
+    g_inspecting = true;
 }
 
 /* --------------------------- character model ----------------------------- */
@@ -110,15 +137,28 @@ void render_camera_idle_orbit(float dt)
 #define ARM_THICK  0.18f
 #define HEAD_SIZE  0.40f
 
-#define HIP_Y      LEG_LEN
-#define SHOULDER_Y (LEG_LEN + TORSO_H - 0.06f)
-#define HEAD_Y     (LEG_LEN + TORSO_H + HEAD_SIZE * 0.5f)
+/* With one box per leg there are no knees to bend, so crouching is drawn by
+ * SHORTENING the legs and dropping everything that rides on top of them by the
+ * same amount. Cheap, and it reads correctly from every camera angle. */
+#define CROUCH_DROP   0.42f   /* fraction of leg length folded away          */
+#define CROUCH_LEAN  17.0f    /* degrees the torso tips forward over the feet */
 
+/* How fast the push-off pose leaves after the feet do. */
+#define TAKEOFF_FADE  0.045f  /* seconds                                     */
+
+/*
+ * `roll` swings the limb out to the side, `pitch` fore and aft. The side-to-side
+ * axis earns its keep: the camera usually sits behind the character, and from
+ * there a leg tucked forward is almost entirely foreshortened -- so without a
+ * lateral component every airborne pose would read as "legs straight down".
+ */
 static void draw_limb(float px, float py, float pz,
-                      float pitch_deg, float len, float thick, Color fill)
+                      float pitch_deg, float roll_deg,
+                      float len, float thick, Color fill)
 {
     rlPushMatrix();
         rlTranslatef(px, py, pz);
+        rlRotatef(roll_deg, 0.0f, 0.0f, 1.0f);
         rlRotatef(pitch_deg, 1.0f, 0.0f, 0.0f);
         Vector3 c = (Vector3){ 0.0f, -len * 0.5f, 0.0f };
         DrawCube(c, thick, len, thick, fill);
@@ -133,37 +173,91 @@ static void draw_fighter(const Fighter *f, Color body, Color accent)
     /* How "walky" the pose is: 0 when standing, 1 at full stride. */
     float walk = fminf(speed / 5.0f, 1.0f);
 
+    /*
+     * The airborne phase, as three overlapping weights plus a takeoff accent.
+     * Computed up front because the whole body uses them -- the legs, the arms
+     * and how far the figure stretches -- and zeroed on the ground, where a
+     * vertical speed of zero would otherwise read as a permanent apex.
+     */
+    float rise = 0.0f, fall = 0.0f, apex = 0.0f, kick = 0.0f;
+    if (!f->grounded) {
+        float t = fmaxf(-1.0f, fminf(1.0f, f->vy / JUMP_SPEED));
+        rise = fmaxf(0.0f, t);
+        fall = fmaxf(0.0f, -t);
+        apex = 1.0f - fabsf(t);
+        /* The push-off is an accent, not a pose: gone inside a tenth of a
+         * second, which is exactly what sells the shove. */
+        kick = expf(-f->air_time / TAKEOFF_FADE) * rise;
+    }
+
+    /* How far the hips are dropped. Crouching holds them down and a landing
+     * pushes them down for a moment; folding both into ONE value means the two
+     * never fight over the legs when you land while holding crouch. */
+    float dip = fminf(1.0f, f->crouch_blend + f->land_blend * 0.85f);
+
+    /* Takeoff stretches and landing squashes: the same idea at both ends of the
+     * jump, and the part of it that reads from any camera angle. */
+    float leg_len    = LEG_LEN * (1.0f - CROUCH_DROP * dip + 0.09f * kick);
+    float hip_y      = leg_len;
+    float shoulder_y = leg_len + TORSO_H - 0.06f;
+    float head_y     = leg_len + TORSO_H + HEAD_SIZE * 0.5f;
+    float stance     = 0.14f + 0.07f * dip;   /* feet widen for a stable base */
+
     /* Sprint reshapes the same walk cycle rather than replacing it: a longer
      * stride, a deeper bob, more forward lean, and arms driven up into a pump.
      * The stride FREQUENCY needs no special case -- gait advances by distance
      * travelled, so moving faster already steps faster. */
     float sb = f->sprint_blend;                             /* 0..1, eased */
 
-    float swing   = sinf(f->gait) * (42.0f + 22.0f * sb) * walk;   /* degrees */
-    float bob     = fabsf(sinf(f->gait)) * (0.05f + 0.035f * sb) * walk;
+    /* Crouching shortens the stride into a shuffle rather than stopping it. */
+    float swing   = sinf(f->gait) * (42.0f + 22.0f * sb) * walk * (1.0f - 0.45f * dip);
+    float bob     = fabsf(sinf(f->gait)) * (0.05f + 0.035f * sb) * walk * (1.0f - dip);
     float breathe = sinf(f->anim_time * 2.0f) * 0.012f * (1.0f - walk);
-    float lean    = walk * (6.0f + 14.0f * sb);             /* lean into the run */
+    float lean    = walk * (6.0f + 14.0f * sb) + CROUCH_LEAN * dip;
     float arm_up  = -22.0f * sb * walk;                     /* elbows come up   */
 
     /* Limb angles. Negative pitch swings a limb FORWARD (the model faces +z
-     * in its own local space). */
+     * in its own local space); roll is how far it splays OUT to the side. */
     float leg_l, leg_r, arm_l, arm_r;
+    float leg_roll, arm_roll;
 
     if (f->grounded) {
         leg_l =  swing;
         leg_r = -swing;
         arm_l = -swing * (0.8f + 0.3f * sb) + arm_up;
         arm_r =  swing * (0.8f + 0.3f * sb) + arm_up;
+
+        /* Landing: the arms come forward and out to catch the weight while the
+         * dip above folds the legs. Fades out with the squash. */
+        arm_l -= 40.0f * f->land_blend;
+        arm_r -= 34.0f * f->land_blend;
+
+        /* Crouching pushes the knees out; the arms always clear the body a
+         * little, and more so at a sprint. */
+        leg_roll = 12.0f * dip;
+        arm_roll =  4.0f + 7.0f * sb + 16.0f * f->land_blend + 8.0f * dip;
     } else {
-        /* Airborne pose: tuck the legs and throw the arms up, biased by
-         * whether we are still rising or already falling. */
-        float t = fmaxf(-1.0f, fminf(1.0f, f->vy / JUMP_SPEED));
-        leg_l = -34.0f + t * 16.0f;
-        leg_r = -12.0f - t * 14.0f;
-        arm_l = -78.0f - t * 24.0f;
-        arm_r = -62.0f - t * 30.0f;
-        bob = 0.0f;
-        lean = 6.0f - t * 6.0f;
+        /*
+         * Airborne. The four phases the simulation names -- takeoff, rise,
+         * apex, fall -- are built here out of the CONTINUOUS weights above
+         * rather than switched on AnimState, so they flow into one another
+         * instead of popping the moment vy crosses a threshold.
+         *
+         *   takeoff  the body stretches, the pushing leg trails behind
+         *   rise     legs driven up under the body, arms thrown overhead
+         *   apex     everything opens out: the hang at the top of the arc
+         *   fall     legs reach down for the ground, arms trail behind
+         */
+        leg_l = -30.0f - 26.0f * rise -  8.0f * apex + 24.0f * fall;
+        leg_r = -14.0f - 10.0f * rise + 12.0f * apex + 28.0f * fall + 52.0f * kick;
+        arm_l = -74.0f - 30.0f * rise - 16.0f * apex + 26.0f * fall;
+        arm_r = -60.0f - 26.0f * rise - 24.0f * apex + 32.0f * fall;
+        bob   = 0.0f;
+        lean  = 7.0f * rise - 11.0f * fall;
+
+        /* Tuck on the way up, open out at the hang, gather again to land. */
+        leg_roll =  4.0f + 20.0f * apex +  6.0f * fall - 10.0f * kick;
+        arm_roll = 10.0f + 30.0f * apex + 18.0f * fall + 12.0f * rise;
     }
 
     /* --- attack pose ----------------------------------------------------- */
@@ -183,7 +277,22 @@ static void draw_fighter(const Fighter *f, Color body, Color accent)
         arm_l *= (1.0f - w);
         arm_r *= (1.0f - w);
 
-        switch (f->attack_index) {
+        if (f->attack_air) {
+            /* One shape for every air swing rather than three. Off the ground
+             * there is nothing to plant a jab or a cross against, so the chain
+             * still advances -- it just reads as one committed dive with both
+             * hands, legs trailing behind the strike.
+             *
+             * The amplitude stops well short of the ground swings' on purpose:
+             * past about -90 the arms come back UP over the head, which reads
+             * as a cheer rather than as a strike. */
+            arm_l += s * -78.0f;
+            arm_r += s * -78.0f;
+            arm_roll *= (1.0f - w);      /* both hands drive down the centre */
+            lean  += s *  30.0f;
+            leg_l += s *  30.0f;
+            leg_r += s *  38.0f;
+        } else switch (f->attack_index) {
         case 0:   /* jab: lead hand snaps out, off hand stays up as a guard */
             arm_r += s * -115.0f;
             arm_l += s *  -30.0f;
@@ -215,8 +324,8 @@ static void draw_fighter(const Fighter *f, Color body, Color accent)
         rlRotatef(f->facing * RAD2DEGF, 0.0f, 1.0f, 0.0f);
 
         /* legs stay in the movement frame -- only the upper body twists ---- */
-        draw_limb(-0.14f, HIP_Y, 0.0f, leg_l, LEG_LEN, LEG_THICK, body);
-        draw_limb( 0.14f, HIP_Y, 0.0f, leg_r, LEG_LEN, LEG_THICK, body);
+        draw_limb(-stance, hip_y, 0.0f, leg_l, -leg_roll, leg_len, LEG_THICK, body);
+        draw_limb( stance, hip_y, 0.0f, leg_r,  leg_roll, leg_len, LEG_THICK, body);
 
         /* Rotating torso, head and arms together about the spine is what makes
          * a punch look thrown rather than poked: the shoulder travels with the
@@ -225,32 +334,52 @@ static void draw_fighter(const Fighter *f, Color body, Color accent)
 
         /* torso ---------------------------------------------------------- */
         rlPushMatrix();
-            rlTranslatef(0.0f, HIP_Y + TORSO_H * 0.5f, 0.0f);
+            rlTranslatef(0.0f, hip_y + TORSO_H * 0.5f, 0.0f);
             rlRotatef(lean, 1.0f, 0.0f, 0.0f);
             DrawCube((Vector3){0}, TORSO_W, TORSO_H, TORSO_D, body);
             DrawCubeWires((Vector3){0}, TORSO_W, TORSO_H, TORSO_D, Fade(BLACK, 0.35f));
         rlPopMatrix();
 
         /* head ----------------------------------------------------------- */
-        DrawCube((Vector3){ 0.0f, HEAD_Y, 0.0f },
+        DrawCube((Vector3){ 0.0f, head_y, 0.0f },
                  HEAD_SIZE, HEAD_SIZE, HEAD_SIZE, accent);
-        DrawCubeWires((Vector3){ 0.0f, HEAD_Y, 0.0f },
+        DrawCubeWires((Vector3){ 0.0f, head_y, 0.0f },
                       HEAD_SIZE, HEAD_SIZE, HEAD_SIZE, Fade(BLACK, 0.4f));
         /* a small nose block so you can always tell which way he is facing */
-        DrawCube((Vector3){ 0.0f, HEAD_Y, HEAD_SIZE * 0.5f + 0.04f },
+        DrawCube((Vector3){ 0.0f, head_y, HEAD_SIZE * 0.5f + 0.04f },
                  0.12f, 0.12f, 0.08f, RAYWHITE);
 
         /* arms ------------------------------------------------------------ */
-        draw_limb(-(TORSO_W * 0.5f + ARM_THICK * 0.5f), SHOULDER_Y, 0.0f,
-                  arm_l, ARM_LEN, ARM_THICK, accent);
-        draw_limb( (TORSO_W * 0.5f + ARM_THICK * 0.5f), SHOULDER_Y, 0.0f,
-                   arm_r, ARM_LEN, ARM_THICK, accent);
+        draw_limb(-(TORSO_W * 0.5f + ARM_THICK * 0.5f), shoulder_y, 0.0f,
+                  arm_l, -arm_roll, ARM_LEN, ARM_THICK, accent);
+        draw_limb( (TORSO_W * 0.5f + ARM_THICK * 0.5f), shoulder_y, 0.0f,
+                   arm_r,  arm_roll, ARM_LEN, ARM_THICK, accent);
 
     rlPopMatrix();
 
-    /* Contact shadow -- a cheap flat disc, but it anchors the model to the
-     * ground far better than lighting would at this cost. It shrinks and fades
-     * with height, which is most of what sells the jump. */
+}
+
+/* An imported skin arrives with its own materials and textures, and a tint is a
+ * MULTIPLY -- at full strength a mid-tone colour turns a textured model into a
+ * dark silhouette. Washing the colour most of the way to white keeps the hue
+ * the player picked while leaving the model's own art legible. */
+static Color mesh_tint(Color c)
+{
+    const float wash = 0.55f;
+    return (Color){
+        (unsigned char)(c.r + (255 - c.r) * wash),
+        (unsigned char)(c.g + (255 - c.g) * wash),
+        (unsigned char)(c.b + (255 - c.b) * wash),
+        255
+    };
+}
+
+/* The contact shadow belongs to whoever is standing there, box model or
+ * imported skin -- a cheap flat disc, but it anchors the character to the
+ * ground far better than lighting would at this cost. It shrinks and fades with
+ * height, which is most of what sells the jump. */
+static void draw_shadow(const Fighter *f)
+{
     float h = fmaxf(0.0f, f->y);
     float shrink = 1.0f / (1.0f + h * 0.55f);
     DrawCylinder((Vector3){ f->x, 0.015f, f->z },
@@ -311,6 +440,16 @@ static void draw_stamina(const Fighter *f, const Cheats *cheats)
     DrawRectangleRoundedLines((Rectangle){ bx, by, bw, bh }, 1.0f, 4,
                               Fade(RAYWHITE, 0.25f * a));
 
+    /* Mark what a jump costs. Without it the jump simply stops working at some
+     * invisible point on the bar; with it you can see the last one coming. */
+    if (!infinite) {
+        float jx = bx + bw * (JUMP_STAMINA_COST / STAMINA_MAX);
+        bool  can_jump = !f->exhausted && f->stamina >= JUMP_STAMINA_COST;
+        DrawRectangle((int)jx, (int)by - 3, 2, (int)bh + 6,
+                      Fade(can_jump ? RAYWHITE : (Color){ 191, 97, 106, 255 },
+                           0.75f * a));
+    }
+
     /* The exhaustion lockout needs to be legible, or it just reads as "sprint
      * randomly stopped working". */
     if (!infinite && f->exhausted) {
@@ -333,8 +472,8 @@ void render_hud(const World *w, float alpha, const HudInfo *info,
     int fps = GetFPS();
     float ms = GetFrameTime() * 1000.0f;
 
-    DrawRectangle(10, 10, 250, 114, Fade(BLACK, 0.55f));
-    DrawRectangleLines(10, 10, 250, 114, Fade(RAYWHITE, 0.25f));
+    DrawRectangle(10, 10, 250, 132, Fade(BLACK, 0.55f));
+    DrawRectangleLines(10, 10, 250, 132, Fade(RAYWHITE, 0.25f));
 
     DrawText(TextFormat("%i FPS", fps), 22, 20, 26,
              fps >= 144 ? GREEN : (fps >= 60 ? YELLOW : RED));
@@ -346,6 +485,10 @@ void render_hud(const World *w, float alpha, const HudInfo *info,
                         fps_limit > 0 ? TextFormat("%i", fps_limit) : "unlimited",
                         vsync ? "  +vsync" : ""),
              22, 104, 14, GRAY);
+    /* What the SIMULATION thinks it is doing, which is not always what the pose
+     * looks like -- the poses blend, the states do not. */
+    DrawText(TextFormat("anim   %s", ANIM_NAMES[w->player.anim]), 22, 122, 14,
+             (Color){ 136, 192, 208, 255 });
 
     /* crosshair-free reticle: a subtle dot, enough to orient the mouselook */
     DrawCircle(GetScreenWidth() / 2, GetScreenHeight() / 2, 2.0f,
@@ -354,8 +497,10 @@ void render_hud(const World *w, float alpha, const HudInfo *info,
     draw_stamina(&w->player, cheats);
 
     const char *help = TextFormat(
-        "WASD move   Shift sprint   Space jump   LMB attack   %s cheats   Esc menu",
-        info->cheat_key ? info->cheat_key : "Tab");
+        "WASD move   Shift sprint   %s crouch   Space jump   LMB attack   "
+        "%s cheats   Esc menu",
+        info->crouch_key ? info->crouch_key : "L Ctrl",
+        info->cheat_key  ? info->cheat_key  : "Tab");
     int tw = MeasureText(help, 14);
     DrawText(help, GetScreenWidth() / 2 - tw / 2, GetScreenHeight() - 26, 14,
              Fade(RAYWHITE, 0.7f));
@@ -374,7 +519,8 @@ void render_end(void)
     EndDrawing();
 }
 
-void render_world(const World *prev, const World *curr, float alpha)
+void render_world(const World *prev, const World *curr, float alpha,
+                  const Hero *hero)
 {
     /* Interpolate the simulation state into a smooth visual state. */
     Fighter p = fighter_lerp(&prev->player, &curr->player, alpha);
@@ -393,6 +539,12 @@ void render_world(const World *prev, const World *curr, float alpha)
     g_look_side = smooth(g_look_side, g_look_side_want, 5.0f, dt);
     g_look_side_want = 0.0f;
 
+    /* Same latch for the inspection zoom: held while a customize page keeps
+     * asking, released the moment it stops, so play never starts zoomed. */
+    g_zoom = smooth(g_zoom, g_inspecting ? g_zoom_want : 0.0f, 7.0f, dt);
+    if (!g_inspecting) g_zoom_want = 0.0f;
+    g_inspecting = false;
+
     /* Screen-right in world terms is (cos yaw, 0, -sin yaw); aiming that far to
      * the fighter's left puts him that far right of centre on screen. */
     Vector3 look = g_cam_look;
@@ -400,17 +552,25 @@ void render_world(const World *prev, const World *curr, float alpha)
     look.z += sinf(g_yaw) * g_look_side;
 
     /* Spherical orbit around the look point. */
+    float dist = CAM_DIST + g_zoom;
     float cp = cosf(g_pitch), sp = sinf(g_pitch);
     g_cam.target   = look;
     g_cam.position = (Vector3){
-        look.x + sinf(g_yaw) * cp * CAM_DIST,
-        look.y + sp * CAM_DIST,
-        look.z + cosf(g_yaw) * cp * CAM_DIST
+        look.x + sinf(g_yaw) * cp * dist,
+        look.y + sp * dist,
+        look.z + cosf(g_yaw) * cp * dist
     };
+
+    /* An imported skin replaces the box fighter when one is selected and
+     * loadable; otherwise the built-in model draws, so the game always has
+     * somebody to play as. */
+    bool skin = model_active(hero->model);
+    if (skin) model_animate(&p, dt);
 
     BeginMode3D(g_cam);
         draw_arena();
-        draw_fighter(&p, (Color){ 94, 129, 172, 255 },
-                         (Color){ 235, 203, 139, 255 });
+        if (!skin || !model_draw(&p, mesh_tint(hero_body(hero))))
+            draw_fighter(&p, hero_body(hero), hero_accent(hero));
+        draw_shadow(&p);
     EndMode3D();
 }

@@ -3,6 +3,8 @@
 
 #include <stdbool.h>
 
+#include "hero.h"
+
 typedef enum DisplayMode {
     DISPLAY_WINDOWED = 0,
     DISPLAY_BORDERLESS,
@@ -16,7 +18,9 @@ typedef struct Settings {
     int  display_mode;   /* DisplayMode                              */
     int  sens_index;     /* index into the mouse sensitivity table   */
     int  cheat_key;      /* raylib keycode that opens the cheat menu */
+    int  crouch_key;     /* raylib keycode held to crouch            */
     bool vsync;
+    Hero hero;           /* who you play as; saved in the same file  */
 } Settings;
 
 /* What the menu wants the caller to do this frame. Shared with the front end
@@ -32,6 +36,8 @@ typedef enum MenuAction {
     MENU_RESUME,
     MENU_PLAY,           /* main menu: start a fresh run           */
     MENU_MAIN_MENU,      /* pause menu: abandon the run, back to the title */
+    MENU_OPEN_CUSTOMIZE, /* main menu: appearance                  */
+    MENU_OPEN_SKINS,     /* customize page: the installed mod skins, one down */
     MENU_QUIT
 } MenuAction;
 
