@@ -13,13 +13,27 @@
 static Camera3D g_cam;
 static Vector3  g_cam_look;      /* smoothed point the camera aims at */
 
-/* Orbit angles, driven by the mouse. */
-static float g_yaw   = 0.0f;     /* radians; 0 puts the camera on +z      */
-static float g_pitch = 0.42f;    /* radians above the horizon             */
-
+#define PITCH_DEFAULT 0.42f      /* radians above the horizon ~24 deg     */
 #define PITCH_MIN 0.06f          /* just above ground level ~3.5 deg      */
 #define PITCH_MAX 1.30f          /* near straight down     ~74 deg        */
 #define CAM_DIST  9.5f
+
+/* Orbit angles, driven by the mouse. */
+static float g_yaw   = 0.0f;     /* radians; 0 puts the camera on +z      */
+static float g_pitch = PITCH_DEFAULT;
+
+/* Front-end drift: one lap every ~60 seconds, slow enough that it reads as a
+ * living shot rather than as a turntable. */
+#define IDLE_ORBIT_RATE 0.105f   /* radians/second                        */
+
+/* The menu's rows run down the middle of the screen, so the front end aims the
+ * camera to one side of the fighter to keep him out from behind them. The
+ * offset is applied in CAMERA space, which is what keeps him parked on the same
+ * side of the frame while the orbit turns all the way round. */
+#define IDLE_LOOK_SIDE  2.8f     /* world units                           */
+
+static float g_look_side;        /* current offset, eased                 */
+static float g_look_side_want;   /* re-asserted every front-end frame     */
 
 /* ------------------------------------------------------------------------ */
 
@@ -63,6 +77,20 @@ static float smooth(float current, float target, float rate, float dt)
 {
     float t = 1.0f - expf(-rate * dt);
     return current + (target - current) * t;
+}
+
+/* The front end has no mouselook, so the camera drifts on its own to keep the
+ * arena behind the menu alive. Pitch eases back to the gameplay default at the
+ * same time, which means returning from a run that ended with the camera
+ * pointing at the floor tidies itself up -- and pressing Play needs no reset,
+ * because the camera is already where gameplay wants it. */
+void render_camera_idle_orbit(float dt)
+{
+    g_yaw += IDLE_ORBIT_RATE * dt;
+    if (g_yaw > PI_F) g_yaw -= 2.0f * PI_F;
+
+    g_pitch = smooth(g_pitch, PITCH_DEFAULT, 2.5f, dt);
+    g_look_side_want = IDLE_LOOK_SIDE;
 }
 
 /* --------------------------- character model ----------------------------- */
@@ -359,13 +387,25 @@ void render_world(const World *prev, const World *curr, float alpha)
     g_cam_look.z = smooth(g_cam_look.z, p.z, 12.0f, dt);
     g_cam_look.y = smooth(g_cam_look.y, 1.2f + p.y * 0.5f, 8.0f, dt);
 
+    /* Ease the lateral aim offset, then drop the request. The front end asserts
+     * it every frame it draws, so gameplay -- which never does -- decays back to
+     * a centred aim on its own, without needing to say so. */
+    g_look_side = smooth(g_look_side, g_look_side_want, 5.0f, dt);
+    g_look_side_want = 0.0f;
+
+    /* Screen-right in world terms is (cos yaw, 0, -sin yaw); aiming that far to
+     * the fighter's left puts him that far right of centre on screen. */
+    Vector3 look = g_cam_look;
+    look.x -= cosf(g_yaw) * g_look_side;
+    look.z += sinf(g_yaw) * g_look_side;
+
     /* Spherical orbit around the look point. */
     float cp = cosf(g_pitch), sp = sinf(g_pitch);
-    g_cam.target   = g_cam_look;
+    g_cam.target   = look;
     g_cam.position = (Vector3){
-        g_cam_look.x + sinf(g_yaw) * cp * CAM_DIST,
-        g_cam_look.y + sp * CAM_DIST,
-        g_cam_look.z + cosf(g_yaw) * cp * CAM_DIST
+        look.x + sinf(g_yaw) * cp * CAM_DIST,
+        look.y + sp * CAM_DIST,
+        look.z + cosf(g_yaw) * cp * CAM_DIST
     };
 
     BeginMode3D(g_cam);

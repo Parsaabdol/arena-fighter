@@ -1,6 +1,7 @@
 #include "game.h"
 #include "settings.h"
 #include "cheats.h"
+#include "frontend.h"
 
 #include "raylib.h"
 
@@ -38,8 +39,20 @@ static void input_to_world(Input *in, float yaw)
     in->move_z = -x * s + z * c;
 }
 
+/* Where the program is, at the top level. All three states share one window and
+ * one world: the front end keeps the simulation ticking with an empty input so
+ * the arena behind the menu is the live thing, and only what is drawn over it
+ * and who owns the mouse actually change. */
+typedef enum AppState {
+    APP_INTRO = 0,      /* the title card, once, at startup   */
+    APP_MENU,           /* the landing screen                 */
+    APP_GAME            /* playing                            */
+} AppState;
+
 /* Which menu page is up. Escape opens the pause menu; the option pages are one
- * step further in, so unpausing never puts you in front of a wall of sliders. */
+ * step further in, so unpausing never puts you in front of a wall of sliders.
+ * The same pages serve the main menu, where SCREEN_NONE means the title screen
+ * itself rather than "no menu at all". */
 typedef enum Screen {
     SCREEN_NONE = 0,
     SCREEN_PAUSE,
@@ -61,7 +74,7 @@ static void commit_settings(Settings *applied, const Settings *pending)
 int main(void)
 {
     SetConfigFlags(FLAG_MSAA_4X_HINT | FLAG_WINDOW_RESIZABLE);
-    InitWindow(1280, 720, "Arena Fighter");
+    InitWindow(1280, 720, GAME_TITLE);
 
     /* Escape belongs to the menus, so it must not also close the window. The
      * only ways out are the Quit button and the title bar X. */
@@ -96,6 +109,7 @@ int main(void)
     prev = curr;
 
     float accumulator = 0.0f;
+    AppState app = APP_INTRO;
     Screen screen = SCREEN_NONE;
     bool  cheats_open = false;
     bool  quit = false;
@@ -103,41 +117,68 @@ int main(void)
     bool  jump_latched = false;
     bool  attack_latched = false;
 
+    intro_reset();
+
     while (!WindowShouldClose() && !quit) {
 
+        /* Wall-clock seconds for this frame, clamped once here. A stall must
+         * not send the simulation into an unbounded catch-up loop, and it must
+         * not skip a beat of the intro either. This is the only place the real
+         * clock is read on the way to the simulation. */
+        float dt = GetFrameTime();
+        if (dt > MAX_FRAME_TIME) dt = MAX_FRAME_TIME;
+
         /* While the options menu is waiting for a key to bind, every keypress
-         * belongs to it -- including Escape, which cancels the capture. */
+         * belongs to it -- including Escape, which cancels the capture. During
+         * the intro every keypress is a skip, which the intro reads itself. */
         bool rebinding = settings_is_rebinding();
 
-        if (!rebinding) {
+        if (!rebinding && app != APP_INTRO) {
             if (IsKeyPressed(KEY_ESCAPE)) {
                 if (cheats_open) {
                     cheats_open = false;
                 } else switch (screen) {
                 case SCREEN_NONE:
-                    pending = applied;              /* start clean each time */
-                    screen = SCREEN_PAUSE;
+                    /* Nothing to pause in the main menu -- it is already the
+                     * outermost screen there. */
+                    if (app == APP_GAME) {
+                        pending = applied;          /* start clean each time */
+                        screen = SCREEN_PAUSE;
+                    }
                     break;
                 case SCREEN_PAUSE:
                     screen = SCREEN_NONE;
                     break;
                 default:                            /* an option page */
                     commit_settings(&applied, &pending);
-                    screen = SCREEN_PAUSE;
+                    screen = (app == APP_GAME) ? SCREEN_PAUSE : SCREEN_NONE;
                     break;
                 }
             }
             /* The cheat key is rebindable, so it is read from settings rather
-             * than hardcoded. */
-            if (screen == SCREEN_NONE && IsKeyPressed(applied.cheat_key))
+             * than hardcoded. It is a gameplay tool, so the front end ignores
+             * it -- there is nothing to cheat at on the title screen. */
+            if (app == APP_GAME && screen == SCREEN_NONE &&
+                IsKeyPressed(applied.cheat_key))
                 cheats_open = !cheats_open;
         }
 
-        bool paused = (screen != SCREEN_NONE) || cheats_open;
+        /* Playing means: in the game, no menu page up, no cheat panel. */
+        bool playing = (app == APP_GAME && screen == SCREEN_NONE && !cheats_open);
+
+        /* The world keeps ticking in the front end so the fighter breathes and
+         * the camera drifts behind the menu; it just gets no input. Only a
+         * paused GAME freezes. */
+        bool simulating = playing || (app != APP_GAME);
 
         /* ---- cursor + look ---------------------------------------------- */
-        if (paused) {
+        if (!playing) {
             if (IsCursorHidden()) EnableCursor();
+
+            /* Drop any latched press on the way out, so a jump pressed a
+             * moment before opening a menu does not fire on the way back in --
+             * or worse, survive into the next run. */
+            jump_latched = attack_latched = false;
         } else {
             if (!IsCursorHidden()) {
                 DisableCursor();     /* hides AND locks to the window centre */
@@ -156,21 +197,24 @@ int main(void)
         }
 
         /* ---- simulate ---------------------------------------------------- */
-        if (paused) {
+        if (!simulating) {
             /* Freeze the world. Collapsing prev onto curr means the renderer
              * has nothing to interpolate, so the paused frame is rock steady
              * instead of jittering between two stale states. */
             prev = curr;
             accumulator = 0.0f;
         } else {
-            float frame = GetFrameTime();
-            if (frame > MAX_FRAME_TIME) frame = MAX_FRAME_TIME; /* no death spiral */
-            accumulator += frame;
+            accumulator += dt;
 
-            Input in = sample_input();
-            input_to_world(&in, render_camera_yaw());
-            in.jump   = jump_latched;
-            in.attack = attack_latched;
+            Input in = (Input){ 0 };
+            if (playing) {
+                in = sample_input();
+                input_to_world(&in, render_camera_yaw());
+                in.jump   = jump_latched;
+                in.attack = attack_latched;
+            } else {
+                render_camera_idle_orbit(dt);   /* front-end backdrop drift */
+            }
 
             while (accumulator >= TICK_DT) {
                 prev = curr;          /* previous state to interpolate from */
@@ -183,7 +227,7 @@ int main(void)
         }
 
         /* How far between `prev` and `curr` this frame lands. */
-        float alpha = paused ? 0.0f : (accumulator / TICK_DT);
+        float alpha = simulating ? (accumulator / TICK_DT) : 0.0f;
 
         /* ---- draw -------------------------------------------------------- */
         HudInfo hud = {
@@ -194,13 +238,53 @@ int main(void)
 
         render_begin();
             render_world(&prev, &curr, alpha);
-            render_hud(&curr, alpha, &hud, &cheats);
 
-            switch (screen) {
+            /* The HUD belongs to the game, not to the title screen. */
+            if (app == APP_GAME) render_hud(&curr, alpha, &hud, &cheats);
+
+            if (app == APP_INTRO) {
+                /* The menu is drawn UNDERNEATH the card, so the card lifting
+                 * away IS the menu arriving -- one continuous shot instead of a
+                 * cut. Its action is discarded until the intro is really over,
+                 * which is also what makes the release of a skip-click safe. */
+                main_menu();
+                if (intro_draw(dt)) app = APP_MENU;
+            } else switch (screen) {
+            case SCREEN_NONE:
+                if (app == APP_MENU) {
+                    switch (main_menu()) {
+                    case MENU_PLAY:
+                        /* A fresh run every time, from a known state. */
+                        world_init(&curr);
+                        prev = curr;
+                        accumulator = 0.0f;
+                        app = APP_GAME;
+                        break;
+                    case MENU_QUIT: quit = true; break;
+                    case MENU_OPEN_SETTINGS:
+                        pending = applied;
+                        screen = SCREEN_SETTINGS;
+                        break;
+                    case MENU_OPEN_KEYBINDS:
+                        pending = applied;
+                        screen = SCREEN_KEYBINDS;
+                        break;
+                    default: break;
+                    }
+                } else if (cheats_open) {
+                    if (cheats_menu(&cheats)) cheats_open = false;
+                }
+                break;
+
             case SCREEN_PAUSE:
                 switch (pause_menu()) {
                 case MENU_RESUME: screen = SCREEN_NONE;     break;
                 case MENU_QUIT:   quit   = true;            break;
+                case MENU_MAIN_MENU:
+                    app = APP_MENU;
+                    cheats_open = false;
+                    screen = SCREEN_NONE;
+                    break;
                 case MENU_OPEN_SETTINGS:
                     pending = applied;
                     screen = SCREEN_SETTINGS;
@@ -230,20 +314,16 @@ int main(void)
                     break;
                 case MENU_BACK:
                     commit_settings(&applied, &pending);
-                    screen = SCREEN_PAUSE;
+                    /* Back to whichever menu sent us here. */
+                    screen = (app == APP_GAME) ? SCREEN_PAUSE : SCREEN_NONE;
                     break;
                 default: break;
                 }
                 break;
             }
 
-            case SCREEN_NONE:
             default:
                 break;
-            }
-
-            if (screen == SCREEN_NONE && cheats_open) {
-                if (cheats_menu(&cheats)) cheats_open = false;
             }
         render_end();
     }

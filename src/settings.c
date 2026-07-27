@@ -339,7 +339,7 @@ MenuAction pause_menu(void)
 {
     MenuAction action = MENU_NONE;
 
-    Rectangle panel = panel_begin("PAUSED", 340.0f, 340.0f);
+    Rectangle panel = panel_begin("PAUSED", 340.0f, 412.0f);
 
     const float pad = 30.0f;
     const float bw  = panel.width - pad * 2.0f;
@@ -355,6 +355,13 @@ MenuAction pause_menu(void)
 
     if (ui_button((Rectangle){ panel.x + pad, y, bw, 46.0f }, "Keybinds", false, true))
         action = MENU_OPEN_KEYBINDS;
+    y += 60.0f;
+
+    /* Abandons the run. Harmless today because there is nothing to lose yet --
+     * once a match has a score or a health bar worth keeping, this is where a
+     * confirmation step belongs. */
+    if (ui_button((Rectangle){ panel.x + pad, y, bw, 46.0f }, "Main Menu", false, true))
+        action = MENU_MAIN_MENU;
     y += 60.0f;
 
     if (ui_button((Rectangle){ panel.x + pad, y, bw, 46.0f }, "Quit Game", true, true))

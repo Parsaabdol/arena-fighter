@@ -140,4 +140,8 @@ void  render_end(void);
 void  render_camera_look(float dx, float dy, float sensitivity);
 float render_camera_yaw(void);
 
+/* Slow automatic drift, for the intro and the main menu where there is no
+ * mouselook. Takes wall-clock seconds: it moves the camera, never the world. */
+void  render_camera_idle_orbit(float dt);
+
 #endif /* GAME_H */

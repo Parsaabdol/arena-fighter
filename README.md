@@ -19,7 +19,10 @@ something you can read and change.
 | `Space` | Jump |
 | `LMB` / `J` | Attack — press again mid-swing to chain jab → cross → finisher |
 | `Tab` | Cheat menu (rebindable) |
-| `Esc` | Pause menu → Settings / Keybinds |
+| `Esc` | Pause menu → Settings / Keybinds / Main Menu |
+| `Enter` | Start playing from the main menu |
+
+Any key skips the intro.
 
 ## Building
 
@@ -48,12 +51,13 @@ tests\run_tests.bat
 
 ```
 src/
-  main.c        window, input sampling, the fixed-timestep loop, menu routing
+  main.c        window, input sampling, the fixed-timestep loop, screen routing
   game.h        shared types and tuning constants for the simulation
   fighter.c     all game logic: movement, stamina, jumping, the attack chain
   render.c      camera, the box-model character, arena, HUD
   ui.c / ui.h   a ~130-line immediate-mode UI (buttons, sliders, steppers)
   settings.c    options/keybind pages plus versioned, checksummed persistence
+  frontend.c    the intro card and the main menu
   cheats.c      the debug cheat panel
 vendor/         raylib 6.0 (headers + prebuilt MSVC binaries)
 tests/          headless tests for the simulation
@@ -80,9 +84,10 @@ anything:
 
 ## Status
 
-Working: movement and camera, sprint/stamina with an exhaustion lockout,
-jumping, a three-hit attack chain with input buffering, settings and rebindable
-keys with persistence, and the cheat panel.
+Working: an intro card that dissolves into a main menu over the live arena,
+movement and camera, sprint/stamina with an exhaustion lockout, jumping, a
+three-hit attack chain with input buffering, settings and rebindable keys with
+persistence, and the cheat panel.
 
 Not built yet: an enemy and its AI, damage and hit reactions, and the ability
 system (the goal is four abilities per hero, some melee, some ranged).

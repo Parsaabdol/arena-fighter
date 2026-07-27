@@ -19,16 +19,19 @@ typedef struct Settings {
     bool vsync;
 } Settings;
 
-/* What the menu wants the caller to do this frame. */
+/* What the menu wants the caller to do this frame. Shared with the front end
+ * (see frontend.h) so main.c routes every menu through one switch shape. */
 typedef enum MenuAction {
     MENU_NONE = 0,
     MENU_APPLY,          /* commit `pending` and write it to disk */
     MENU_REVERT,         /* throw `pending` away                  */
     MENU_DEFAULTS,       /* load the factory defaults into `pending` */
-    MENU_BACK,           /* leave this page, back to the pause menu */
+    MENU_BACK,           /* leave this page, back to wherever we came from */
     MENU_OPEN_SETTINGS,
     MENU_OPEN_KEYBINDS,
     MENU_RESUME,
+    MENU_PLAY,           /* main menu: start a fresh run           */
+    MENU_MAIN_MENU,      /* pause menu: abandon the run, back to the title */
     MENU_QUIT
 } MenuAction;
 
