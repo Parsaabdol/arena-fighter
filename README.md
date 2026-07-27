@@ -61,9 +61,6 @@ tests/          headless tests for the simulation
 
 ## How it works
 
-For the full picture — frame flow, module boundaries, invariants, and what is
-built versus stubbed — see [ARCHITECTURE.md](ARCHITECTURE.md).
-
 A few ideas do most of the work, and they are worth knowing before changing
 anything:
 
