@@ -30,6 +30,17 @@ assets/
 ARCHITECTURE.md
 CLAUDE.md
 
+# --- tooling leftovers ----------------------------------------------------
+# tools/ IS tracked -- it is the export pipeline, and shipping it instead of
+# the art is what keeps this repository publishable. Only Python's cache and
+# the importer's remembered paths go, both of which are per-machine.
+__pycache__/
+*.pyc
+tools/importer-config.json
+
+# The preview binary is build output, like ArenaFighter.exe.
+SkinPreview.exe
+
 # --- editor / OS ----------------------------------------------------------
 .vs/
 .vscode/

@@ -73,6 +73,34 @@ made them, and this repository is public and MIT licensed — committing one wou
 be redistributing it under a licence we have no right to grant. Keep your models
 local.
 
+### Dota 2 heroes
+
+If you own Dota 2, `tools/` will build one into a skin for you, reading your own
+installed copy of the game and writing to your own `assets/`. Double-click
+**`tools/import-heroes.bat`** for a window: two searchable lists — what is in
+your game and what you could add — with Export, Preview and Delete. The preview
+is a small turntable built from the game's own loader, so it shows what the game
+will draw without starting it.
+
+`tools/export-hero.bat` is the same thing at a prompt. From a terminal:
+
+```
+python tools/export_hero.py pudge          # -> assets/pudge.glb
+python tools/export_hero.py --list         # every hero you have
+python tools/export_hero.py pudge --dry-run
+```
+
+It needs Python 3 and
+[Source2Viewer-CLI](https://github.com/ValveResourceFormat/ValveResourceFormat/releases);
+it finds Dota through Steam on its own. There is more to a hero than the obvious
+export — his gear is a separate model per slot, the clip you want is often not
+the one with the obvious name, and the slot list contains duplicates that
+z-fight if you load both — so the script handles all of it and explains itself
+as it goes. See [tools/README.md](tools/README.md).
+
+Shipping the pipeline instead of the art is the point: nothing of Valve's ever
+enters this repository, and you extract from a copy you already own.
+
 ## Building
 
 Windows only for now. You need the **MSVC build tools** (Visual Studio 2022

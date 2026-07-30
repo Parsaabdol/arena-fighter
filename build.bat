@@ -31,7 +31,31 @@ cl /nologo /std:c17 /O2 /GL /fp:fast /MD /W4 /wd4996 ^
    raylib.lib opengl32.lib gdi32.lib winmm.lib user32.lib shell32.lib kernel32.lib
 
 set ERR=%ERRORLEVEL%
+if not %ERR%==0 goto :done
+
+REM SkinPreview.exe -- the importer in tools/ shells out to this to show you a
+REM skin without starting the game. It lives in src\preview\ rather than src\
+REM so the wildcard above does not pick up its main(), and it deliberately
+REM links the SAME model.c and anim_gltf.c: the whole value of it is that the
+REM loader deciding how a skin looks is the game's, not a copy of the game's.
+REM fighter.c comes along because the clip pacing asks it when a swing lands.
+cl /nologo /std:c17 /O2 /fp:fast /MD /W4 /wd4996 ^
+   /I"%RAYLIB%\include" /I"%ROOT%vendor\cgltf" /I"%ROOT%src" ^
+   "%ROOT%src\preview\preview_main.c" "%ROOT%src\model.c" ^
+   "%ROOT%src\anim_gltf.c" "%ROOT%src\fighter.c" ^
+   /Fe:"%ROOT%SkinPreview.exe" ^
+   /link /INCREMENTAL:NO /LIBPATH:"%RAYLIB%\lib" ^
+   /SUBSYSTEM:WINDOWS /ENTRY:mainCRTStartup ^
+   raylib.lib opengl32.lib gdi32.lib winmm.lib user32.lib shell32.lib kernel32.lib
+
+set ERR=%ERRORLEVEL%
+
+:done
 popd
 
-if %ERR%==0 (echo. & echo Build OK  -^>  %ROOT%ArenaFighter.exe) else (echo. & echo BUILD FAILED)
+if %ERR%==0 (
+  echo.
+  echo Build OK  -^>  %ROOT%ArenaFighter.exe
+  echo           -^>  %ROOT%SkinPreview.exe
+) else (echo. & echo BUILD FAILED)
 exit /b %ERR%
