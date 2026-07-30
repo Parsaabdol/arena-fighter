@@ -349,6 +349,12 @@ int main(void)
                     /* Deeper, not sideways: the mod list keeps the edits the
                      * page above it has already made. */
                     screen = SCREEN_SKINS;
+                    /* Re-read assets/ on the way in. Skins arrive while the
+                     * game is running -- tools/export_hero.py writes one in
+                     * about a minute -- and having to restart to see it is a
+                     * poor answer when opening the page can just look again.
+                     * Cheap: a directory listing, once, on a click. */
+                    model_scan();
                     break;
                 case MENU_BACK:
                     if (screen == SCREEN_SKINS) {

@@ -45,6 +45,11 @@
  * glTF facing +Z as well, so no correction is needed for most packs. Set this
  * to 180 if an imported skin runs backwards -- it is per-model, not universal,
  * and it is the first thing to try when a new one looks wrong. */
+/* How much of his height a crouching imported skin folds away. Matched to the
+ * built-in fighter, which shortens its legs by CROUCH_DROP of LEG_LEN -- about
+ * 18% of FIGHTER_HEIGHT -- so the two crouch to the same silhouette height. */
+#define CROUCH_SQUASH  0.18f
+
 #ifndef MODEL_YAW
 #define MODEL_YAW      0.0f
 #endif
@@ -104,20 +109,34 @@ static float g_move_frame;   /* walk/sprint playhead, advanced by ground speed *
  * the file, so even a Mixamo export with one meaningless name still moves.
  * ------------------------------------------------------------------------- */
 
-#define ALIAS_MAX 6
+#define ALIAS_MAX 7
 
 static const char *const CLIP_ALIASES[ANIM_COUNT][ALIAS_MAX] = {
     [ANIM_IDLE]         = { "idle", "stand", "breath", "loadout" },
     [ANIM_WALK]         = { "walk", "jog", "move", "run" },
-    [ANIM_SPRINT]       = { "sprint", "run", "jog", "walk" },
+    /* "haste" outranks "run" here on purpose. Dota has no sprint, but most
+     * heroes carry a faster run authored for the Haste rune, which is exactly
+     * the pose a sprint wants -- and it is the one clip in the file the plain
+     * run should lose to. It is demoted in AVOID, which still holds: that only
+     * breaks ties WITHIN an alias, so it never beats a real run for ANIM_WALK. */
+    [ANIM_SPRINT]       = { "sprint", "haste", "run", "jog", "walk" },
     [ANIM_CROUCH]       = { "crouch", "duck", "sneak", "idle" },
-    [ANIM_JUMP_TAKEOFF] = { "jump_start", "jumpstart", "takeoff", "jump" },
-    [ANIM_JUMP_RISE]    = { "jump_up", "jumpup", "rise", "jump" },
-    [ANIM_JUMP_APEX]    = { "jump_idle", "float", "air", "jump" },
-    [ANIM_JUMP_FALL]    = { "fall", "jump_down", "jumpdown", "jump" },
+    /* "flail" comes last on every airborne row, so a pack with real jump clips
+     * still wins. It is there for the ones that do not: Dota authors no jump,
+     * but ACT_DOTA_FLAIL is what a hero plays while tossed through the air,
+     * which is the same problem seen from the other side. Beware the near-miss
+     * -- ACT_DOTA_FLAIL_STATUE is a petrified topple and several heroes name
+     * it plainly `flail` while the airborne one is `flail_anim`. */
+    [ANIM_JUMP_TAKEOFF] = { "jump_start", "jumpstart", "takeoff", "jump", "flail" },
+    [ANIM_JUMP_RISE]    = { "jump_up", "jumpup", "rise", "jump", "flail" },
+    [ANIM_JUMP_APEX]    = { "jump_idle", "float", "air", "jump", "flail" },
+    [ANIM_JUMP_FALL]    = { "fall", "jump_down", "jumpdown", "jump", "flail" },
     [ANIM_LAND]         = { "land", "jump_end", "jumpend", "idle" },
     [ANIM_ATTACK]       = { "attack", "punch", "swing", "slash", "kick", "chop" },
-    [ANIM_HURT]         = { "hit", "hurt", "damage", "impact", "flinch", "death" },
+    /* "die" trails "death" because it is the looser of the two -- it is also a
+     * substring of words like "soldier" -- but without it a Source 2 hero has
+     * no hurt clip at all, since Valve names them dieBack / dieForward. */
+    [ANIM_HURT]         = { "hit", "hurt", "damage", "impact", "flinch", "death", "die" },
     [ANIM_SPECIAL]      = { "special", "cast", "ability", "spell", "channel" },
 };
 
@@ -392,6 +411,132 @@ static ModelAnimation *load_anims_guarded(const char *path, int *count,
     return anims;
 }
 
+/*
+ * The box the model occupies while standing in its idle pose.
+ *
+ * The fit below wants to know how tall the character is and where his feet
+ * are, and the obvious source -- the raw mesh vertices -- answers a subtly
+ * different question: it measures the BIND pose. On a body-only export the two
+ * agree closely enough. On a full export they do not: a hero's bind pose holds
+ * his weapon hanging point-down past his heels, so the raw box's floor is the
+ * tip of a club. Fitting to that shrinks the hero to make room for it and then
+ * lifts him until the club touches the ground and he does not -- measured on
+ * Ogre Magi with his gear, 8.7% short and floating 0.16 units.
+ *
+ * So pose him first. UpdateModelAnimation runs the same CPU skinning the
+ * renderer will, leaving the result in mesh.animVertices, which is exactly the
+ * space the player sees -- unit conversion, axis conversion and all.
+ *
+ * That leaves the other end of the character. A full export also hands him the
+ * things he CARRIES, and Witch Doctor's staff stands a third again as tall as
+ * he does -- fit the whole silhouette and he is scaled down to make room for
+ * his own staff, ending up 29% shorter than everyone else. What separates a
+ * staff from a hat is not size, position or width (all three were measured,
+ * none of them separate): it is that a body DEFORMS as it moves and a carried
+ * prop does not. So the height is measured over the meshes that bend, and a
+ * mesh is judged by whether the distance between two of its vertices survives
+ * a change of pose.
+ *
+ * The fallback matters as much as the rule: raylib's robot is rigid parts all
+ * the way down, and dropping every rigid mesh would leave nothing to measure.
+ * When the deforming meshes are not most of the model, nothing is a prop.
+ *
+ * Returns false when there is nothing to pose with (no clips, or a mesh with no
+ * skin weights), and the caller falls back to the raw box.
+ */
+#define RIGID_SAMPLES  48     /* vertex pairs measured per mesh          */
+#define RIGID_TOL      0.01f  /* 1% -- float noise, not a bending limb   */
+#define RIGID_MESH_MAX 32     /* beyond this a mesh is assumed to deform */
+
+static void mesh_pair_spans(const Mesh *mesh, float *span)
+{
+    /* Any two points of a rigid body hold their distance however it is placed,
+     * so real edges are unnecessary -- pairs picked by index do just as well. */
+    int n = mesh->vertexCount;
+    for (int s = 0; s < RIGID_SAMPLES; s++) {
+        int a = (n > 1) ? (int)((long long)s * n / RIGID_SAMPLES) : 0;
+        int b = (a + n / 2) % (n > 0 ? n : 1);
+        const float *pa = &mesh->animVertices[a * 3];
+        const float *pb = &mesh->animVertices[b * 3];
+        float dx = pa[0] - pb[0], dy = pa[1] - pb[1], dz = pa[2] - pb[2];
+        span[s] = sqrtf(dx * dx + dy * dy + dz * dz);
+    }
+}
+
+static bool pose_bounding_box(BoundingBox *out)
+{
+    if (!g_animated || g_clip[ANIM_IDLE] < 0) return false;
+
+    ModelAnimation anim = g_anims[g_clip[ANIM_IDLE]];
+    int count = g_model.meshCount;
+    if (count > RIGID_MESH_MAX) count = RIGID_MESH_MAX;
+
+    static float span_a[RIGID_MESH_MAX][RIGID_SAMPLES];
+    static float span_b[RIGID_MESH_MAX][RIGID_SAMPLES];
+    Vector3 mesh_lo[RIGID_MESH_MAX], mesh_hi[RIGID_MESH_MAX];
+    bool deforms[RIGID_MESH_MAX];
+
+    /* First pose: the boxes come from here, so every later measurement is of
+     * the same stance. */
+    UpdateModelAnimation(g_model, anim, 0.0f);
+
+    int total = 0;
+    for (int m = 0; m < count; m++) {
+        const Mesh *mesh = &g_model.meshes[m];
+        deforms[m] = true;
+        mesh_lo[m] = (Vector3){  1e9f,  1e9f,  1e9f };
+        mesh_hi[m] = (Vector3){ -1e9f, -1e9f, -1e9f };
+        if (!mesh->animVertices || mesh->vertexCount <= 0) continue;
+        for (int v = 0; v < mesh->vertexCount; v++) {
+            Vector3 p = { mesh->animVertices[v * 3 + 0],
+                          mesh->animVertices[v * 3 + 1],
+                          mesh->animVertices[v * 3 + 2] };
+            mesh_lo[m] = Vector3Min(mesh_lo[m], p);
+            mesh_hi[m] = Vector3Max(mesh_hi[m], p);
+        }
+        mesh_pair_spans(mesh, span_a[m]);
+        total += mesh->vertexCount;
+    }
+    if (total == 0) return false;
+
+    /* Second pose, far enough along the clip to have moved. A one-frame clip
+     * cannot answer the question, and then nothing is a prop. */
+    int soft = 0;
+    if (anim.keyframeCount > 1) {
+        UpdateModelAnimation(g_model, anim, (float)(anim.keyframeCount / 2));
+        for (int m = 0; m < count; m++) {
+            const Mesh *mesh = &g_model.meshes[m];
+            if (!mesh->animVertices || mesh->vertexCount <= 0) continue;
+            mesh_pair_spans(mesh, span_b[m]);
+            bool rigid = true;
+            for (int s = 0; s < RIGID_SAMPLES; s++) {
+                float a = span_a[m][s];
+                if (a <= 1e-4f) continue;
+                if (fabsf(span_b[m][s] - a) / a > RIGID_TOL) { rigid = false; break; }
+            }
+            deforms[m] = !rigid;
+            if (deforms[m]) soft += mesh->vertexCount;
+        }
+        UpdateModelAnimation(g_model, anim, 0.0f);   /* leave him standing */
+    }
+
+    bool props = (anim.keyframeCount > 1) && (soft * 2 >= total);
+
+    Vector3 lo = {  1e9f,  1e9f,  1e9f };
+    Vector3 hi = { -1e9f, -1e9f, -1e9f };
+    for (int m = 0; m < count; m++) {
+        if (mesh_hi[m].x < mesh_lo[m].x) continue;      /* nothing measured */
+        if (props && !deforms[m]) continue;
+        lo = Vector3Min(lo, mesh_lo[m]);
+        hi = Vector3Max(hi, mesh_hi[m]);
+    }
+
+    if (hi.x < lo.x) return false;
+    out->min = lo;
+    out->max = hi;
+    return true;
+}
+
 static bool load(const char *file)
 {
     const char *path = TextFormat("%s%s/%s", GetApplicationDirectory(),
@@ -442,7 +587,8 @@ static bool load(const char *file)
      * so the up axis is the one whose minimum sits at roughly zero, while the
      * other runs well negative.
      */
-    BoundingBox bb = GetModelBoundingBox(g_model);
+    BoundingBox bb;
+    bool posed = pose_bounding_box(&bb);
 
     /* That box measures the raw vertices -- but an animated mesh renders
      * through the skinning matrices, whose rest pose applies whatever
@@ -450,8 +596,10 @@ static bool load(const char *file)
      * AND Z-up to Y-up, on a Source 2 rig). Judge the box the skinning will
      * actually produce: testing the raw one means inspecting a space the
      * player never sees, and the "correction" below then lays an
-     * already-upright hero on his face. */
-    if (g_animated && g_anims_custom) {
+     * already-upright hero on his face.
+     *
+     * A posed box already went through the skinning and so needs none of this. */
+    if (!posed && g_animated && g_anims_custom) {
         Vector3 lo = {  1e9f,  1e9f,  1e9f };
         Vector3 hi = { -1e9f, -1e9f, -1e9f };
         for (int i = 0; i < 8; i++) {
@@ -633,11 +781,33 @@ bool model_draw(const Fighter *f, Color tint)
 {
     if (!g_loaded) return false;
 
+    /*
+     * Crouch, for a skeleton nobody authored one for.
+     *
+     * No character pack outside a platformer ships a crouch, and Dota
+     * certainly does not, so ANIM_CROUCH falls back to idle and an imported
+     * fighter used to duck by standing perfectly still. Rather than pose the
+     * skeleton -- which would need to know where its hips are, and every rig
+     * names them differently -- squash the whole model vertically about its
+     * feet. That is the same trick the built-in fighter uses (§8: there are no
+     * knees in a one-box limb, so it shortens the legs and drops everything
+     * riding on them), and it works here for the same reason: it reads from
+     * every camera angle and needs to know nothing about the rig.
+     *
+     * The landing squash rides along in the same value, which is why an
+     * imported skin now compresses on touchdown as the box fighter does.
+     */
+    float dip    = fminf(1.0f, f->crouch_blend + f->land_blend * 0.85f);
+    float squash = 1.0f - CROUCH_SQUASH * dip;
+
+    /* The lift scales with the squash or the feet leave the floor: it is the
+     * distance from the model's origin down to its feet, and that distance is
+     * being compressed too. */
     DrawModelEx(g_model,
-                (Vector3){ f->x, f->y + g_lift, f->z },
+                (Vector3){ f->x, f->y + g_lift * squash, f->z },
                 (Vector3){ 0.0f, 1.0f, 0.0f },
                 f->facing * RAD2DEG_ + MODEL_YAW,
-                (Vector3){ g_fit, g_fit, g_fit },
+                (Vector3){ g_fit, g_fit * squash, g_fit },
                 tint);
     return true;
 }
