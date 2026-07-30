@@ -222,6 +222,11 @@ int main(void)
             if (playing) {
                 in = sample_input(&applied);
                 input_to_world(&in, render_camera_yaw());
+                /* Shoot where you are LOOKING, not where you are walking. The
+                 * simulation still knows nothing about a camera -- it is handed
+                 * a world-space yaw, exactly as movement is. Note this is the
+                 * LOOK yaw, not the orbit yaw: they differ by half a turn. */
+                in.aim = render_camera_aim_yaw();
                 in.jump   = jump_latched;
                 in.attack = attack_latched;
             } else {

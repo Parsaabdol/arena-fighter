@@ -20,8 +20,31 @@
 #define MAX_FRAME_TIME 0.25f
 
 /* World is a flat disc. Movement happens on the (x, z) ground plane; y is
- * height, driven only by jumping and gravity. */
-#define ARENA_RADIUS 12.0f
+ * height, driven only by jumping and gravity. The disc sits on a much larger
+ * ground plane that the renderer draws out to the horizon -- the bound is a
+ * rule, not a wall. */
+#define ARENA_RADIUS 26.0f
+
+/* ---------------------------------------------------------------------------
+ * Combat.
+ *
+ * A swing throws a bolt rather than reaching: it makes the hit legible at any
+ * frame rate, gives the AI something it can plausibly miss with, and is the
+ * shape abilities will need anyway (§13.3 -- ranged implies projectiles as
+ * simulation entities).
+ * ------------------------------------------------------------------------- */
+#define HEALTH_MAX          100.0f
+#define HEALTH_REGEN          2.0f   /* per second, always, while alive      */
+#define DAMAGE_MIN           10      /* inclusive                            */
+#define DAMAGE_MAX           17      /* inclusive                            */
+#define RESPAWN_TIME          5.0f   /* seconds face-down before you are back */
+
+#define FIGHTER_RADIUS        0.45f  /* the body a bolt has to hit           */
+#define BOLT_MAX             24      /* fixed pool; the tick never allocates */
+#define BOLT_SPEED           22.0f
+#define BOLT_RADIUS           0.22f
+#define BOLT_LIFE             2.2f   /* seconds before it fizzles out        */
+#define BOLT_HEIGHT           1.05f  /* chest height, where it spawns and flies */
 
 /* ---------------------------------------------------------------------------
  * How big a fighter is. One number, owned by the SIMULATION.
@@ -133,15 +156,71 @@ typedef struct Fighter {
     bool  attack_air;      /* this swing started airborne -- latched, so it   */
                            /* does not change shape when you land mid-swing   */
     float chain_grace;     /* seconds the finished chain stays "continuable"  */
+    /* True for exactly the tick on which this swing's strike lands. The tick
+     * has to report it rather than the caller inferring it from attack_time:
+     * a buffered press chains the swing on that very tick and resets the clock
+     * to zero, so by the time anyone looks the moment has already gone. */
+    bool  struck;
+    float attack_aim;      /* yaw this swing throws along -- latched at start */
 
+    /* health, death and the way back */
     float health;
+    bool  alive;
+    float respawn;      /* seconds left face-down; 0 while alive             */
+    float hurt_flash;   /* 0..1, set by a hit, decays -- presentation only   */
 } Fighter;
+
+/* ------------------------------ projectiles ------------------------------ */
+
+/*
+ * A bolt in flight. Plain data in a fixed-size pool on `World`, because the
+ * tick allocates nothing and `World` has to stay copyable with `=`.
+ */
+typedef struct Bolt {
+    bool  active;
+    float x, y, z;
+    float vx, vz;
+    float life;         /* seconds remaining                                */
+    int   owner;        /* SIDE_PLAYER or SIDE_ENEMY -- never hits its own  */
+} Bolt;
+
+enum { SIDE_PLAYER = 0, SIDE_ENEMY = 1 };
+
+/* --------------------------------- enemy --------------------------------- */
+
+/*
+ * The opponent's brain. Deliberately mediocre: it thinks on a slow clock,
+ * aims with an error it does not correct for, and picks its next move from a
+ * weighted guess rather than from what would actually work. A perfect duelist
+ * would be easier to write and no fun to fight.
+ */
+typedef enum AiMood {
+    AI_WAIT = 0,   /* stand and reconsider                                  */
+    AI_CHASE,      /* close the distance                                    */
+    AI_FIGHT,      /* in range, throwing bolts                              */
+    AI_BACK,       /* give ground for a moment                              */
+    AI_COUNT
+} AiMood;
+
+typedef struct Ai {
+    AiMood mood;
+    float  think;       /* seconds until it reconsiders                     */
+    float  cooldown;    /* seconds until it may swing again                 */
+    float  aim_error;   /* radians, rolled per shot and not corrected       */
+    float  strafe;      /* -1 or +1, which way it circles                   */
+} Ai;
 
 /* Per-frame input. move_x/move_z are already in WORLD space -- main.c rotates
  * the raw key directions by the camera yaw before handing them over, so the
  * simulation never needs to know a camera exists. */
 typedef struct Input {
     float move_x, move_z;
+    /* World-space yaw the fighter wants to SHOOT along, which is not the way
+     * it happens to be walking. main.c feeds the camera yaw; the AI feeds its
+     * guess at where the player is. Latched at the start of a swing, because a
+     * bolt should leave along the aim you committed to, not wherever you had
+     * turned by the time the strike landed. */
+    float aim;
     bool  attack;       /* edge-triggered: true only on the tick that swings */
     bool  special;
     bool  jump;         /* edge-triggered: true only on the tick that jumps */
@@ -152,14 +231,35 @@ typedef struct Input {
 /* ------------------------------- world ----------------------------------- */
 
 typedef struct World {
-    Fighter player;
+    Fighter  player;
+    Fighter  enemy;
+    Ai       ai;
+    Bolt     bolts[BOLT_MAX];
     uint64_t tick;
+
+    /*
+     * Deterministic randomness.
+     *
+     * Invariant 1 says no randomness reachable from world_tick, and what that
+     * invariant protects is REPRODUCIBILITY: the same inputs must give the
+     * same result, so replays and rollback stay possible. A generator seeded
+     * once in world_init and advanced only inside the tick keeps that promise
+     * exactly -- it is a pure function of (seed, tick history), not of the
+     * wall clock or the allocator. What is still forbidden is rand(), any
+     * seeding from time(), and drawing numbers anywhere outside the tick.
+     */
+    uint32_t rng;
 } World;
 
 /* fighter.c */
 void  fighter_init(Fighter *f, float x, float z);
 void  fighter_tick(Fighter *f, Input in, const Cheats *cheats);
 Fighter fighter_lerp(const Fighter *a, const Fighter *b, float t);
+
+/* Draw the next value. Deterministic; see World.rng. */
+uint32_t world_rand(World *w);
+/* Uniform in [lo, hi] inclusive. */
+int   world_rand_range(World *w, int lo, int hi);
 
 /* Seconds into the current swing at which the strike lands (the end of the
  * ACTIVE window), or 0 when not attacking. The renderer anchors an imported
@@ -197,6 +297,9 @@ void  render_end(void);
  * it raw mouse deltas and reads the yaw back to make movement camera-relative. */
 void  render_camera_look(float dx, float dy, float sensitivity);
 float render_camera_yaw(void);
+/* The yaw the camera looks ALONG, in the simulation's convention (0 = +z).
+ * Half a turn from render_camera_yaw, which is where the camera sits. */
+float render_camera_aim_yaw(void);
 
 /* Front-end framing: parks the fighter to one side of the menu, and with
  * `drift` set also turns slowly for the title backdrop. Wall-clock seconds --

@@ -8,6 +8,7 @@
 #include <math.h>
 
 #define PI_F 3.14159265358979323846f
+#define TAU_F (2.0f * PI_F)
 #define RAD2DEGF (180.0f / PI_F)
 
 /* The camera lives here rather than in the world because it is a presentation
@@ -95,6 +96,24 @@ void render_camera_look(float dx, float dy, float sensitivity)
 float render_camera_yaw(void)
 {
     return g_yaw;
+}
+
+/*
+ * The yaw the camera is LOOKING along, in the simulation's convention where a
+ * yaw of 0 means +z.
+ *
+ * These two differ by half a turn and it is easy to miss. g_yaw places the
+ * camera on the orbit -- at g_yaw = 0 it sits at +z -- so the direction it
+ * faces is -z, which is a fighter facing of PI. Feeding g_yaw straight in as an
+ * aim sends every shot out of the back of your head, which is exactly what it
+ * did until this existed.
+ */
+float render_camera_aim_yaw(void)
+{
+    float a = g_yaw + PI_F;
+    if (a >  PI_F) a -= 2.0f * PI_F;
+    if (a < -PI_F) a += 2.0f * PI_F;
+    return a;
 }
 
 /* Frame-rate independent exponential smoothing.
@@ -402,28 +421,218 @@ static void draw_shadow(const Fighter *f)
 
 /* ------------------------------- arena ----------------------------------- */
 
+/* ---------------------------------------------------------------------------
+ * The ground.
+ *
+ * The arena is a rule, not a room: the fighters are held inside ARENA_RADIUS,
+ * but the ground runs out to GROUND_EXTENT so the eye never finds an edge, and
+ * the horizon is the same colour as the sky so the two meet in haze. Nothing
+ * out there is simulated -- it is scenery, and it exists so that walking to the
+ * rim reads as "far enough" rather than "the world stops here".
+ *
+ * Every plant is placed by hashing its index. That keeps the field identical
+ * from run to run without storing a single position, and without touching the
+ * simulation's generator -- scenery must never draw from it, or the renderer
+ * would be advancing simulation state (invariant 3).
+ * ------------------------------------------------------------------------- */
+#define GROUND_EXTENT   260.0f
+#define PLANT_COUNT     900
+#define PLANT_FIELD     70.0f    /* plants scatter this far from the centre  */
+
+static const Color SKY_COLOR   = { 143, 178, 199, 255 };
+static const Color GRASS_NEAR  = {  92, 118,  76, 255 };
+static const Color GRASS_FAR   = {  78, 100,  68, 255 };
+
+/* Integer hash -> [0,1). Deterministic, cheap, and entirely the renderer's. */
+static float hash01(unsigned int n)
+{
+    n = (n ^ 61u) ^ (n >> 16);
+    n *= 9u;
+    n ^= n >> 4;
+    n *= 0x27d4eb2du;
+    n ^= n >> 15;
+    return (float)(n & 0xFFFFFFu) / (float)0x1000000u;
+}
+
+static void draw_plant(float x, float z, float y, float scale, Color leaf)
+{
+    /* Three crossed blades. Cheap, and from any angle at least one is edge-on
+     * rather than all of them, which is what stops a field of these reading as
+     * a field of flat cards. */
+    for (int i = 0; i < 3; i++) {
+        float a = (float)i * (PI_F / 3.0f);
+        float dx = sinf(a) * 0.09f * scale;
+        float dz = cosf(a) * 0.09f * scale;
+        DrawTriangle3D((Vector3){ x - dx, y, z - dz },
+                       (Vector3){ x + dx, y, z + dz },
+                       (Vector3){ x, y + 0.42f * scale, z },
+                       leaf);
+        /* Backface: raylib culls, and a blade visible from one side only
+         * flickers as the camera swings round it. */
+        DrawTriangle3D((Vector3){ x + dx, y, z + dz },
+                       (Vector3){ x - dx, y, z - dz },
+                       (Vector3){ x, y + 0.42f * scale, z },
+                       leaf);
+    }
+}
+
+/* ------------------------------- the enemy ------------------------------- */
+
+static const Color ENEMY_BODY   = { 176,  78,  74, 255 };
+static const Color ENEMY_ACCENT = { 226, 160, 120, 255 };
+
+/* Wash a colour toward white for a moment after a hit. The flash is a Fighter
+ * field the simulation sets and decays, so both fighters flash on the same
+ * tick they take damage, at any frame rate. */
+static Color hurt_tint(Color c, float flash)
+{
+    if (flash <= 0.0f) return c;
+    float t = flash * 0.75f;
+    return (Color){
+        (unsigned char)(c.r + (255 - c.r) * t),
+        (unsigned char)(c.g + (255 - c.g) * t),
+        (unsigned char)(c.b + (255 - c.b) * t),
+        c.a,
+    };
+}
+
+/* A bolt in flight: a bright core with a short tail behind it along its own
+ * velocity, which is what sells the direction at a glance. */
+static void draw_bolts(const World *prev, const World *curr, float alpha)
+{
+    for (int i = 0; i < BOLT_MAX; i++) {
+        const Bolt *b = &curr->bolts[i];
+        if (!b->active) continue;
+
+        /* Interpolate only when the slot held the same bolt last tick --
+         * otherwise a freshly spawned one would streak in from wherever the
+         * previous occupant died. */
+        const Bolt *a = &prev->bolts[i];
+        bool same = a->active && a->owner == b->owner && a->life > b->life;
+        Vector3 pos = same
+            ? (Vector3){ a->x + (b->x - a->x) * alpha,
+                         a->y + (b->y - a->y) * alpha,
+                         a->z + (b->z - a->z) * alpha }
+            : (Vector3){ b->x, b->y, b->z };
+
+        Color core = (b->owner == SIDE_PLAYER)
+                   ? (Color){ 150, 220, 255, 255 }
+                   : (Color){ 255, 170, 120, 255 };
+
+        float inv = 1.0f / BOLT_SPEED;
+        Vector3 tail = { pos.x - b->vx * inv * 0.55f, pos.y,
+                         pos.z - b->vz * inv * 0.55f };
+
+        DrawCylinderEx(tail, pos, BOLT_RADIUS * 0.35f, BOLT_RADIUS,
+                       6, Fade(core, 0.55f));
+        DrawSphere(pos, BOLT_RADIUS, core);
+        DrawSphere(pos, BOLT_RADIUS * 1.7f, Fade(core, 0.22f));
+    }
+}
+
+/* A health bar pinned over a fighter's head. Projected by hand rather than
+ * billboarded so it stays a constant size on screen -- a bar that shrinks with
+ * distance is exactly the thing you cannot read when you need it. */
+static void draw_overhead_health(const Fighter *f)
+{
+    Vector3 head = { f->x, f->y + FIGHTER_HEIGHT + 0.45f, f->z };
+    Vector2 s = GetWorldToScreen(head, g_cam);
+
+    /* Behind the camera, or off screen: GetWorldToScreen still returns a
+     * point, and drawing it would put a bar in the wrong place entirely. */
+    Vector3 to = { head.x - g_cam.position.x, head.y - g_cam.position.y,
+                   head.z - g_cam.position.z };
+    Vector3 fwd = { g_cam.target.x - g_cam.position.x,
+                    g_cam.target.y - g_cam.position.y,
+                    g_cam.target.z - g_cam.position.z };
+    if (to.x * fwd.x + to.y * fwd.y + to.z * fwd.z <= 0.0f) return;
+
+    const float w = 96.0f, h = 8.0f;
+    float x = s.x - w * 0.5f, y = s.y - h;
+    float frac = f->health / HEALTH_MAX;
+    if (frac < 0.0f) frac = 0.0f;
+    if (frac > 1.0f) frac = 1.0f;
+
+    DrawRectangle((int)x - 1, (int)y - 1, (int)w + 2, (int)h + 2,
+                  Fade(BLACK, 0.55f));
+    DrawRectangle((int)x, (int)y, (int)(w * frac), (int)h,
+                  frac > 0.5f ? (Color){ 120, 200, 110, 255 }
+                : frac > 0.25f ? (Color){ 226, 192,  90, 255 }
+                               : (Color){ 214,  92,  84, 255 });
+    DrawRectangleLines((int)x - 1, (int)y - 1, (int)w + 2, (int)h + 2,
+                       Fade(RAYWHITE, 0.35f));
+}
+
+/*
+ * Every horizontal surface here sits at a DIFFERENT height, and that is not
+ * fussiness -- it is the whole reason the ground does not shimmer.
+ *
+ * Two coplanar polygons have equal depth at every pixel they share, so which
+ * one wins is decided by float noise and changes as the camera moves: the
+ * result is a flicker across the entire overlap. The first cut of this arena
+ * put the plain at y=0 and a disc whose top face also landed at exactly y=0,
+ * and the two fought over every pixel of a 32-unit circle.
+ *
+ * So the plain is BELOW the arena floor, and the arena floor is the surface
+ * the fighters actually stand on:
+ *
+ *      y = +0.030   bound ring, centre mark
+ *      y = +0.015   shadows
+ *      y = +0.002   plant bases
+ *      y =  0.000   arena floor  <- fighters stand here
+ *      y = -0.060   the far plain
+ */
+#define GROUND_DROP     0.060f   /* how far the far plain sits below the floor */
+#define ARENA_PAD       6.0f     /* floor extends past the bound by this much  */
+#define PLANT_BASE      0.002f
+
 static void draw_arena(void)
 {
-    DrawCylinder((Vector3){ 0.0f, -0.05f, 0.0f },
-                 ARENA_RADIUS, ARENA_RADIUS, 0.05f, 64,
-                 (Color){ 46, 52, 64, 255 });
+    /* The plain, well past anywhere you can walk, and clearly below the floor
+     * so the two can never contest a pixel. */
+    DrawPlane((Vector3){ 0.0f, -GROUND_DROP, 0.0f },
+              (Vector2){ GROUND_EXTENT, GROUND_EXTENT }, GRASS_FAR);
 
-    /* rim */
+    /* The arena floor: a low plateau whose top IS y = 0. */
+    DrawCylinder((Vector3){ 0.0f, -GROUND_DROP, 0.0f },
+                 ARENA_RADIUS + ARENA_PAD, ARENA_RADIUS + ARENA_PAD,
+                 GROUND_DROP, 72, GRASS_NEAR);
+
+    /* The bound itself: a worn ring rather than a fence. Concentric rings never
+     * overlap each other, so these only need to clear the floor. */
     for (int i = 0; i < 3; i++) {
-        DrawCircle3D((Vector3){ 0.0f, 0.02f + i * 0.004f, 0.0f },
-                     ARENA_RADIUS - i * 0.03f,
+        DrawCircle3D((Vector3){ 0.0f, 0.030f, 0.0f },
+                     ARENA_RADIUS - i * 0.06f,
                      (Vector3){ 1.0f, 0.0f, 0.0f }, 90.0f,
-                     (Color){ 129, 161, 193, 255 });
+                     (Color){ 196, 186, 150, 190 });
     }
 
-    /* centre mark, gives a sense of scale and motion while walking */
-    DrawCircle3D((Vector3){ 0.0f, 0.02f, 0.0f }, 2.0f,
-                 (Vector3){ 1.0f, 0.0f, 0.0f }, 90.0f, Fade(SKYBLUE, 0.35f));
+    /* Centre mark -- scale and a sense of motion while walking. */
+    DrawCircle3D((Vector3){ 0.0f, 0.030f, 0.0f }, 2.0f,
+                 (Vector3){ 1.0f, 0.0f, 0.0f }, 90.0f,
+                 Fade((Color){ 214, 208, 180, 255 }, 0.5f));
 
-    rlPushMatrix();
-        rlTranslatef(0.0f, 0.01f, 0.0f);
-        DrawGrid(26, 1.0f);
-    rlPopMatrix();
+    for (int i = 0; i < PLANT_COUNT; i++) {
+        /* sqrt on the radius keeps the scatter even rather than bunched at the
+         * middle, which is what a raw uniform radius would give. */
+        float r = sqrtf(hash01((unsigned)i * 3u + 1u)) * PLANT_FIELD;
+        float a = hash01((unsigned)i * 7u + 5u) * TAU_F;
+        float x = sinf(a) * r, z = cosf(a) * r;
+
+        float t = hash01((unsigned)i * 11u + 3u);
+        float scale = 0.6f + t * 0.9f;
+
+        /* A few are taller and bluer: shrubs among the grass. */
+        Color leaf = (t > 0.88f)
+                   ? (Color){ 104, 128, 92, 255 }
+                   : (Color){ (unsigned char)(96 + t * 40.0f),
+                              (unsigned char)(124 + t * 34.0f),
+                              (unsigned char)(72 + t * 22.0f), 255 };
+        /* Just clear of the floor: a blade whose base edge lay exactly on it
+         * would fight along that edge. Outside the plateau they stand a few
+         * centimetres proud of the plain, which is invisible at that range. */
+        draw_plant(x, z, PLANT_BASE, (t > 0.88f) ? scale * 1.9f : scale, leaf);
+    }
 }
 
 /* -------------------------------- HUD ------------------------------------ */
@@ -503,6 +712,40 @@ void render_hud(const World *w, float alpha, const HudInfo *info,
     DrawText(TextFormat("anim   %s", ANIM_NAMES[w->player.anim]), 22, 122, 14,
              (Color){ 136, 192, 208, 255 });
 
+    /* --- health ---------------------------------------------------------- */
+    {
+        const Fighter *p = &w->player;
+        int sw = GetScreenWidth(), sh = GetScreenHeight();
+        const int bw = 300, bh = 18;
+        int bx = sw / 2 - bw / 2, by = sh - 96;
+
+        float frac = p->health / HEALTH_MAX;
+        if (frac < 0.0f) frac = 0.0f;
+        if (frac > 1.0f) frac = 1.0f;
+
+        DrawRectangle(bx - 2, by - 2, bw + 4, bh + 4, Fade(BLACK, 0.6f));
+        DrawRectangle(bx, by, (int)(bw * frac), bh,
+                      frac > 0.5f ? (Color){ 120, 200, 110, 255 }
+                    : frac > 0.25f ? (Color){ 226, 192,  90, 255 }
+                                   : (Color){ 214,  92,  84, 255 });
+        DrawRectangleLines(bx - 2, by - 2, bw + 4, bh + 4, Fade(RAYWHITE, 0.35f));
+        DrawText(TextFormat("%i", (int)(p->health + 0.5f)), bx + bw + 10,
+                 by + 1, 16, RAYWHITE);
+
+        /* Dead: say so, and count down, because a respawn you cannot time is
+         * indistinguishable from a hang. */
+        if (!p->alive) {
+            const char *msg = "DOWN";
+            int tw = MeasureText(msg, 52);
+            DrawText(msg, sw / 2 - tw / 2, sh / 2 - 70, 52,
+                     (Color){ 226, 108, 100, 255 });
+            const char *sub = TextFormat("back in %.1f", (double)p->respawn);
+            int sw2 = MeasureText(sub, 22);
+            DrawText(sub, sw / 2 - sw2 / 2, sh / 2 - 12, 22,
+                     Fade(RAYWHITE, 0.85f));
+        }
+    }
+
     /* crosshair-free reticle: a subtle dot, enough to orient the mouselook */
     DrawCircle(GetScreenWidth() / 2, GetScreenHeight() / 2, 2.0f,
                Fade(RAYWHITE, 0.35f));
@@ -524,7 +767,9 @@ void render_hud(const World *w, float alpha, const HudInfo *info,
 void render_begin(void)
 {
     BeginDrawing();
-    ClearBackground((Color){ 24, 26, 33, 255 });
+    /* The horizon is this colour too, so ground and sky meet in haze rather
+     * than at a visible edge. */
+    ClearBackground(SKY_COLOR);
 }
 
 void render_end(void)
@@ -578,13 +823,37 @@ void render_world(const World *prev, const World *curr, float alpha,
     /* An imported skin replaces the box fighter when one is selected and
      * loadable; otherwise the built-in model draws, so the game always has
      * somebody to play as. */
+    Fighter e = fighter_lerp(&prev->enemy, &curr->enemy, alpha);
+
     bool skin = model_active(hero->model);
     if (skin) model_animate(&p, dt);
 
     BeginMode3D(g_cam);
         draw_arena();
-        if (!skin || !model_draw(&p, mesh_tint(hero_body(hero))))
-            draw_fighter(&p, hero_body(hero), hero_accent(hero));
-        draw_shadow(&p);
+
+        if (p.alive) {
+            if (!skin || !model_draw(&p, mesh_tint(hero_body(hero))))
+                draw_fighter(&p, hero_body(hero), hero_accent(hero));
+            draw_shadow(&p);
+        }
+
+        /*
+         * The opponent is always the built-in box fighter, never the imported
+         * skin. Not a style choice: model.c holds ONE loaded model with ONE
+         * playhead (§12), so drawing two fighters through it would give them
+         * the same pose on the same frame. A box that moves correctly beats a
+         * hero that mirrors you.
+         */
+        if (e.alive) {
+            draw_fighter(&e, hurt_tint(ENEMY_BODY, e.hurt_flash),
+                         ENEMY_ACCENT);
+            draw_shadow(&e);
+        }
+
+        draw_bolts(prev, curr, alpha);
     EndMode3D();
+
+    /* Health above the head, projected after the 3D pass so it is flat to the
+     * screen and always legible. */
+    if (e.alive) draw_overhead_health(&e);
 }

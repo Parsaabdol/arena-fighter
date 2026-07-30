@@ -39,6 +39,17 @@ echo.
 echo --- movement, jumping, stamina, crouch ---
 .\test_move.exe
 set ERR=%ERRORLEVEL%
+if not %ERR%==0 goto done
+
+cl /nologo /std:c17 /W4 /MD /I"%ROOT%src" ^
+   "%ROOT%tests\test_combat.c" "%ROOT%src\fighter.c" /Fe:test_combat.exe
+set ERR=%ERRORLEVEL%
+if not %ERR%==0 goto done
+
+echo.
+echo --- damage, death, respawn, projectiles ---
+.\test_combat.exe
+set ERR=%ERRORLEVEL%
 
 :done
 popd

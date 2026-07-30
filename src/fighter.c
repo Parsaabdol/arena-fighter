@@ -194,7 +194,12 @@ void fighter_init(Fighter *f, float x, float z)
     f->attack_buffered = false;
     f->attack_air = false;
     f->chain_grace = 0.0f;
-    f->health = 100.0f;
+    f->struck = false;
+    f->attack_aim = 0.0f;
+    f->health = HEALTH_MAX;
+    f->alive = true;
+    f->respawn = 0.0f;
+    f->hurt_flash = 0.0f;
 }
 
 static void set_anim(Fighter *f, AnimState s)
@@ -211,12 +216,21 @@ void fighter_tick(Fighter *f, Input in, const Cheats *cheats)
     bool infinite = (cheats && cheats->unlimited_sprint);
 
     /* --- attack chain ---------------------------------------------------- */
+    f->struck = false;      /* one tick only; set below if the strike lands */
+
     if (f->attacking) {
         const AttackDef *a = &ATTACKS[f->attack_index];
         float chain_from = a->startup + a->active;   /* recovery = combo window */
         float total      = chain_from + a->recovery;
 
+        float was = f->attack_time;
         f->attack_time += dt;
+
+        /* Record the crossing BEFORE the chain below can reset the clock. The
+         * combo window opens at exactly the strike, so a buffered press starts
+         * the next swing on this same tick -- and anyone reading attack_time
+         * afterwards would see 0 and conclude nothing had happened. */
+        if (was < chain_from && f->attack_time >= chain_from) f->struck = true;
 
         /* A press that arrives mid-swing is too early to chain, so remember it
          * and spend it the instant the window opens. This one line of buffering
@@ -229,6 +243,10 @@ void fighter_tick(Fighter *f, Input in, const Cheats *cheats)
             f->attack_time = 0.0f;
             f->attack_buffered = false;
             f->attack_air = !f->grounded;   /* a new swing, so re-read the feet */
+            /* This is a NEW swing, so it gets its own bolt and its own aim.
+             * Forgetting these is silent: the chain animates correctly and only
+             * the first swing of it ever throws anything. */
+            f->attack_aim = in.aim;
         } else if (f->attack_time >= total) {
             f->attacking = false;
             f->attack_buffered = false;
@@ -254,6 +272,7 @@ void fighter_tick(Fighter *f, Input in, const Cheats *cheats)
             f->attack_buffered = false;
             f->attack_air = !f->grounded;
             f->chain_grace = 0.0f;
+            f->attack_aim = in.aim;
         }
     }
 
@@ -485,7 +504,6 @@ Fighter fighter_lerp(const Fighter *a, const Fighter *b, float t)
     /* gait wraps at TAU, so interpolate on the shortest arc as well */
     r.gait         = angle_lerp(a->gait, b->gait, t);
     r.anim_time    = lerpf(a->anim_time, b->anim_time, t);
-    r.health       = lerpf(a->health, b->health, t);
     r.stamina      = lerpf(a->stamina, b->stamina, t);
     r.sprint_blend = lerpf(a->sprint_blend, b->sprint_blend, t);
     r.crouch_blend = lerpf(a->crouch_blend, b->crouch_blend, t);
@@ -510,19 +528,284 @@ Fighter fighter_lerp(const Fighter *a, const Fighter *b, float t)
     r.attack_buffered = b->attack_buffered;
     r.attack_air      = b->attack_air;
     r.chain_grace     = b->chain_grace;
+    r.struck          = b->struck;
+    r.attack_aim      = b->attack_aim;
+    r.alive           = b->alive;
+    r.respawn         = b->respawn;
+    /* Health steps down on one tick and drifts up on every other, so a plain
+     * lerp is right for the drift and would smear the hit. Snap downward. */
+    r.health          = (b->health < a->health)
+                      ? b->health : lerpf(a->health, b->health, t);
+    /* Likewise the flash: it is set to 1 on impact and decays. */
+    r.hurt_flash      = (b->hurt_flash > a->hurt_flash)
+                      ? b->hurt_flash : lerpf(a->hurt_flash, b->hurt_flash, t);
     return r;
 }
 
 /* ----------------------------- world ------------------------------------- */
 
+/* ---------------------------------------------------------------------------
+ * Deterministic randomness.
+ *
+ * xorshift32: four lines, no state beyond the word itself, and good enough for
+ * damage rolls and aim error. Seeded by world_init with a fixed constant, never
+ * from the clock -- see the note on World.rng for why that still satisfies
+ * invariant 1.
+ * ------------------------------------------------------------------------- */
+uint32_t world_rand(World *w)
+{
+    uint32_t x = w->rng;
+    x ^= x << 13;
+    x ^= x >> 17;
+    x ^= x << 5;
+    w->rng = x;
+    return x;
+}
+
+int world_rand_range(World *w, int lo, int hi)
+{
+    if (hi <= lo) return lo;
+    return lo + (int)(world_rand(w) % (uint32_t)(hi - lo + 1));
+}
+
+static float rand_unit(World *w)          /* -1 .. +1 */
+{
+    return (float)(world_rand(w) % 20001u) / 10000.0f - 1.0f;
+}
+
+/* ------------------------------- projectiles ----------------------------- */
+
+static void bolt_spawn(World *w, const Fighter *from, int owner, float aim)
+{
+    for (int i = 0; i < BOLT_MAX; i++) {
+        Bolt *b = &w->bolts[i];
+        if (b->active) continue;
+        b->active = true;
+        b->x = from->x + sinf(aim) * 0.55f;
+        b->y = from->y + BOLT_HEIGHT;
+        b->z = from->z + cosf(aim) * 0.55f;
+        b->vx = sinf(aim) * BOLT_SPEED;
+        b->vz = cosf(aim) * BOLT_SPEED;
+        b->life = BOLT_LIFE;
+        b->owner = owner;
+        return;
+    }
+    /* Pool full: the shot is simply lost. With BOLT_MAX at 24 and a 2.2s life
+     * that needs both fighters swinging flat out, and dropping one is better
+     * than growing the world struct mid-tick. */
+}
+
+static void hurt(World *w, Fighter *f)
+{
+    if (!f->alive) return;
+    f->health -= (float)world_rand_range(w, DAMAGE_MIN, DAMAGE_MAX);
+    f->hurt_flash = 1.0f;
+    if (f->health <= 0.0f) {
+        f->health = 0.0f;
+        f->alive = false;
+        f->respawn = RESPAWN_TIME;
+        /* Drop everything that was in progress. Coming back mid-swing with a
+         * buffered follow-up would be a gift nobody asked for. */
+        f->attacking = false;
+        f->attack_buffered = false;
+        f->chain_grace = 0.0f;
+        f->vx = f->vz = 0.0f;
+    }
+}
+
+/* Does a bolt overlap this fighter? Measured against FIGHTER_RADIUS, never
+ * against whatever mesh happens to be drawn -- invariant 7. */
+static bool bolt_hits(const Bolt *b, const Fighter *f)
+{
+    if (!f->alive) return false;
+    float dx = b->x - f->x;
+    float dz = b->z - f->z;
+    float r  = FIGHTER_RADIUS + BOLT_RADIUS;
+    if (dx * dx + dz * dz > r * r) return false;
+    /* Bolts fly at chest height, so a jump can carry you over one. */
+    float dy = b->y - (f->y + FIGHTER_HEIGHT * 0.5f);
+    return fabsf(dy) < FIGHTER_HEIGHT * 0.5f;
+}
+
+static void bolts_tick(World *w, float dt)
+{
+    for (int i = 0; i < BOLT_MAX; i++) {
+        Bolt *b = &w->bolts[i];
+        if (!b->active) continue;
+
+        b->x += b->vx * dt;
+        b->z += b->vz * dt;
+        b->life -= dt;
+
+        Fighter *target = (b->owner == SIDE_PLAYER) ? &w->enemy : &w->player;
+        if (bolt_hits(b, target)) {
+            hurt(w, target);
+            b->active = false;
+            continue;
+        }
+
+        float edge = ARENA_RADIUS + 4.0f;
+        if (b->life <= 0.0f || b->x * b->x + b->z * b->z > edge * edge)
+            b->active = false;
+    }
+}
+
+/* A swing throws exactly one bolt, at the moment the strike lands, so the
+ * projectile leaves on the same tick the animation reads as contact. */
+static void fire_on_strike(World *w, Fighter *f, int side)
+{
+    if (!f->struck) return;
+
+    /* The latched aim, NOT f->facing: fighter_tick turns a fighter toward
+     * where it is travelling, so a strafing enemy would otherwise throw its
+     * bolts out sideways. */
+    bolt_spawn(w, f, side, f->attack_aim);
+}
+
+/* ----------------------------------- ai ---------------------------------- */
+/*
+ * Weak on purpose, in three separate ways, because any one of them alone reads
+ * as a bug rather than as an opponent:
+ *
+ *   it thinks on a slow clock, so it commits to a bad idea for a while;
+ *   it aims with an error rolled per shot and never leads a moving target;
+ *   it picks its next mood from a weighted guess, not from what would work.
+ */
+#define AI_THINK_MIN     0.45f
+#define AI_THINK_MAX     1.10f
+#define AI_COOLDOWN      0.85f   /* between swings -- slower than a player   */
+#define AI_AIM_ERROR     0.20f   /* radians, about 11 degrees                */
+#define AI_RANGE_NEAR    5.0f
+#define AI_RANGE_FAR    14.0f
+#define AI_TURN_RATE     4.5f    /* radians/sec -- deliberately sluggish     */
+
+static void ai_tick(World *w, Input *out, float dt)
+{
+    Ai *ai = &w->ai;
+    Fighter *e = &w->enemy;
+    const Fighter *p = &w->player;
+
+    *out = (Input){ 0 };
+    if (!e->alive) return;
+
+    float dx = p->x - e->x;
+    float dz = p->z - e->z;
+    float dist = sqrtf(dx * dx + dz * dz);
+    float to_player = atan2f(dx, dz);
+
+    ai->think -= dt;
+    ai->cooldown -= dt;
+
+    if (ai->think <= 0.0f) {
+        ai->think = AI_THINK_MIN
+                  + (AI_THINK_MAX - AI_THINK_MIN)
+                    * (float)(world_rand(w) % 1000u) / 1000.0f;
+        ai->strafe = (world_rand(w) & 1u) ? 1.0f : -1.0f;
+
+        /* Weighted, not optimal. A good fraction of the time it does the wrong
+         * thing for the distance it is at, which is most of what makes it
+         * beatable. */
+        int roll = world_rand_range(w, 0, 99);
+        if (dist > AI_RANGE_FAR)       ai->mood = (roll < 80) ? AI_CHASE : AI_WAIT;
+        else if (dist > AI_RANGE_NEAR) ai->mood = (roll < 60) ? AI_FIGHT
+                                                : (roll < 85) ? AI_CHASE : AI_WAIT;
+        else                           ai->mood = (roll < 45) ? AI_FIGHT
+                                                : (roll < 80) ? AI_BACK : AI_WAIT;
+    }
+
+    /* Face the player, slowly, and only ever toward where they are NOW. */
+    float turn = to_player - e->facing;
+    while (turn >  PI_F) turn -= TAU_F;
+    while (turn < -PI_F) turn += TAU_F;
+    float step = AI_TURN_RATE * dt;
+    e->facing += (turn > step) ? step : (turn < -step ? -step : turn);
+
+    float fx = sinf(to_player), fz = cosf(to_player);
+    float sx = fz * ai->strafe, sz = -fx * ai->strafe;
+
+    switch (ai->mood) {
+    case AI_CHASE:
+        out->move_x = fx;
+        out->move_z = fz;
+        break;
+    case AI_FIGHT:
+        /* Circle while shooting rather than standing still. */
+        out->move_x = sx * 0.7f;
+        out->move_z = sz * 0.7f;
+        if (ai->cooldown <= 0.0f && !e->attacking) {
+            out->attack = true;
+            ai->cooldown = AI_COOLDOWN;
+            /* Rolled once, here, and never corrected: it does not lead a
+             * moving target, so crossing its line is how you make it miss. */
+            ai->aim_error = rand_unit(w) * AI_AIM_ERROR;
+            out->aim = to_player + ai->aim_error;
+        }
+        break;
+    case AI_BACK:
+        out->move_x = -fx;
+        out->move_z = -fz;
+        break;
+    case AI_WAIT:
+    default:
+        break;
+    }
+}
+
+/* ---------------------------------- world -------------------------------- */
+
+static void life_tick(Fighter *f, float x, float z, float dt)
+{
+    if (f->alive) {
+        f->health += HEALTH_REGEN * dt;
+        if (f->health > HEALTH_MAX) f->health = HEALTH_MAX;
+    } else {
+        f->respawn -= dt;
+        if (f->respawn <= 0.0f) {
+            /* A clean slate rather than a patch-up: fighter_init already knows
+             * every field, and a half-reset is how a stale flag survives. */
+            fighter_init(f, x, z);
+        }
+    }
+    f->hurt_flash -= dt * 3.0f;
+    if (f->hurt_flash < 0.0f) f->hurt_flash = 0.0f;
+}
+
 void world_init(World *w)
 {
     fighter_init(&w->player, 0.0f, 0.0f);
+    fighter_init(&w->enemy, 0.0f, 9.0f);
+    w->enemy.facing = PI_F;          /* looking back at the player */
+
+    for (int i = 0; i < BOLT_MAX; i++) w->bolts[i] = (Bolt){ 0 };
+
+    w->ai = (Ai){ .mood = AI_WAIT, .think = 0.6f, .cooldown = 0.5f,
+                  .aim_error = 0.0f, .strafe = 1.0f };
     w->tick = 0;
+
+    /* Fixed seed. Not the clock -- that is what would break determinism. */
+    w->rng = 0x9E3779B9u;
 }
 
 void world_tick(World *w, Input in, const Cheats *cheats)
 {
+    /* Order is fixed: brain, then bodies, then what they threw. Everything
+     * within a tick reads the same snapshot. */
+    Input ai_in;
+    ai_tick(w, &ai_in, TICK_DT);
+
+    /* A dead fighter takes no orders. */
+    if (!w->player.alive) in = (Input){ 0 };
+
     fighter_tick(&w->player, in, cheats);
+    fighter_tick(&w->enemy, ai_in, cheats);
+
+    fire_on_strike(w, &w->player, SIDE_PLAYER);
+    fire_on_strike(w, &w->enemy, SIDE_ENEMY);
+
+    bolts_tick(w, TICK_DT);
+
+    life_tick(&w->player, 0.0f, 0.0f, TICK_DT);
+    life_tick(&w->enemy, 0.0f, 9.0f, TICK_DT);
+
     w->tick++;
 }
