@@ -18,12 +18,17 @@ static Vector3  g_cam_look;      /* smoothed point the camera aims at */
 #define PITCH_DEFAULT 0.42f      /* radians above the horizon ~24 deg     */
 #define PITCH_MIN 0.06f          /* just above ground level ~3.5 deg      */
 #define PITCH_MAX 1.30f          /* near straight down     ~74 deg        */
-#define CAM_DIST  9.5f
+/* Close enough that the fighter fills about a third of the frame height, the
+ * over-the-shoulder distance the third-person shooters use. Pulling back past
+ * this trades the world you are looking at for empty floor around him. */
+#define CAM_DIST  4.1f
 
 /* How close and far the inspection view may pull. Gameplay always sits at
- * CAM_DIST -- the zoom is a front-end affordance, not a camera setting. */
-#define ZOOM_MIN  -5.0f
-#define ZOOM_MAX   4.0f
+ * CAM_DIST -- the zoom is a front-end affordance, not a camera setting. The
+ * range is what a whole model needs to be looked at, so its floor is well short
+ * of clipping into one and its ceiling still frames a Dota hero's silhouette. */
+#define ZOOM_MIN  -1.2f
+#define ZOOM_MAX   8.5f
 
 /* Orbit angles, driven by the mouse. */
 static float g_yaw   = 0.0f;     /* radians; 0 puts the camera on +z      */
@@ -39,8 +44,15 @@ static float g_pitch = PITCH_DEFAULT;
  * side of the frame while the orbit turns all the way round. */
 #define IDLE_LOOK_SIDE  2.8f     /* world units                           */
 
-static float g_look_side;        /* current offset, eased                 */
-static float g_look_side_want;   /* re-asserted every front-end frame     */
+/* Gameplay uses the same mechanism for the opposite reason: parking the fighter
+ * left of centre means the half of the frame you are running into is the half
+ * he is not standing in. Negative, because a positive offset aims left of him
+ * and so pushes him right. This is the resting value -- the front end overrides
+ * it while it draws, and the view eases back here the moment it stops. */
+#define PLAY_LOOK_SIDE (-0.8f)
+
+static float g_look_side     = PLAY_LOOK_SIDE;   /* current offset, eased */
+static float g_look_side_want = PLAY_LOOK_SIDE;  /* re-asserted per frame */
 
 /* Inspection zoom, in world units added to CAM_DIST. Held while the customize
  * pages ask for it and eased away once they stop, the same one-frame latch the
@@ -55,7 +67,8 @@ void render_init(void)
 {
     g_cam_look = (Vector3){ 0.0f, 1.2f, 0.0f };
 
-    g_cam.position   = (Vector3){ 0.0f, 5.0f, 9.5f };
+    g_cam.position   = (Vector3){ 0.0f, sinf(PITCH_DEFAULT) * CAM_DIST,
+                                        cosf(PITCH_DEFAULT) * CAM_DIST };
     g_cam.target     = g_cam_look;
     g_cam.up         = (Vector3){ 0.0f, 1.0f, 0.0f };
     g_cam.fovy       = 55.0f;
@@ -533,11 +546,12 @@ void render_world(const World *prev, const World *curr, float alpha,
     g_cam_look.z = smooth(g_cam_look.z, p.z, 12.0f, dt);
     g_cam_look.y = smooth(g_cam_look.y, 1.2f + p.y * 0.5f, 8.0f, dt);
 
-    /* Ease the lateral aim offset, then drop the request. The front end asserts
-     * it every frame it draws, so gameplay -- which never does -- decays back to
-     * a centred aim on its own, without needing to say so. */
+    /* Ease the lateral aim offset, then drop the request back to the gameplay
+     * framing. The front end asserts its own every frame it draws, so gameplay
+     * -- which never does -- returns to the over-the-shoulder offset on its own,
+     * without needing to say so. */
     g_look_side = smooth(g_look_side, g_look_side_want, 5.0f, dt);
-    g_look_side_want = 0.0f;
+    g_look_side_want = PLAY_LOOK_SIDE;
 
     /* Same latch for the inspection zoom: held while a customize page keeps
      * asking, released the moment it stops, so play never starts zoomed. */
